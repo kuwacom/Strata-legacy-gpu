@@ -2325,7 +2325,7 @@ if(STRATA_NATIVE_EXPERTS)
     # (CUDA_MODULE_LOADING=EAGER), and these four took ~3.8 MB of VRAM (3 expert slots of IQ3_XXS on a P100) from every
     # model.  gfx906 (HIP: code objects load on first use) keeps them in strata_mmq.
     set(_strata_mmq_cuda_types ${_strata_mmq_types})
-    set(_strata_kq_types q4_k q5_k q5_1 q6_k)
+    set(_strata_kq_types q3_k q4_k q5_k q5_1 q6_k)   # q3_k: the dense GDN projections' STRATA_DENSE_MMQ
     set(_strata_kq_dso OFF)
     if(STRATA_MMQ_KQUANTS AND STRATA_HIP_GFX906)
       list(APPEND _strata_mmq_cuda_types ${_strata_kq_types})
@@ -2333,7 +2333,13 @@ if(STRATA_NATIVE_EXPERTS)
       set(_strata_kq_dso ON)
     endif()
     foreach(_t IN LISTS _strata_mmq_cuda_types)
-      target_sources(strata_mmq PRIVATE ${_strata_mmq}/template-instances/mmq-instance-${_t}.cu)
+      # the overlay's instance when it has one: a patched MMQ config (the Pascal I tile) only reaches a type's
+      # kernels through an instance compiled beside it (the pinned file includes "../mmq.cuh" from its own folder)
+      set(_inst "${_strata_mmq}/template-instances/mmq-instance-${_t}.cu")
+      if(_strata_mmq_tq_overlay AND EXISTS "${_strata_tq_overlay_dir}/template-instances/mmq-instance-${_t}.cu")
+        set(_inst "${_strata_tq_overlay_dir}/template-instances/mmq-instance-${_t}.cu")
+      endif()
+      target_sources(strata_mmq PRIVATE ${_inst})
     endforeach()
     if(_strata_mmq_tq_overlay)
       foreach(_t tq2_t tqk6 tqk7 tqp5 tqp6 tqp7)

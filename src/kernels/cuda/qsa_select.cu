@@ -2066,7 +2066,11 @@ bool scores_thread_on() {
         int major = 0, minor = 0;
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
         cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
-        ok[dev] = strata::sm75_default(major, minor) ? 1 : 2;   // Turing, STRATA_SM75_PERF=1
+        // sm_61 (P40) も既定でこちらを使う: warp 版は (query, block) ごとに key 512 B を query の数だけ
+        // 読み直すため、長いプロンプトの select は DRAM 帯域で頭打ちになる（480K で 179 TB の推定）。
+        // この版は key を 64 query で共有し、シャッフルも無い（同じビット）
+        const bool pascal = strata::cc_major_of(major) == 6 && strata::cc_minor_of(minor) == 1;
+        ok[dev] = (strata::sm75_default(major, minor) || pascal) ? 1 : 2;   // Turing, STRATA_SM75_PERF=1
     }
     return ok[dev] == 1;
 }

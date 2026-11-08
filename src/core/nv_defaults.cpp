@@ -50,6 +50,24 @@ std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int m
             {"STRATA_FUSE_DECODE", "1"},         // -1.3
             {"STRATA_GR_UP75", "1"},             // -1.2
         };
+    } else if (mj == 6 && mn == 1) {
+        // Tesla P40 (sm_61): the seven sm_60 scheduling switches plus the sm_86 ones that have a Pascal path.  Every one
+        // is bit-exact on the cards it was measured on (docs/DETAILS.md's per-architecture table); the P40 has dp4a, no
+        // BF16, 48 KB of shared memory per block and no tensor core, and its expert mode 8 already fuses gate/up + SwiGLU
+        // + q8_1, so the sm_86 table's GU_SWIGLU (CUDA layout only) is left out here.
+        if (off("STRATA_SM61_PERF")) return t;
+        t = {
+            {"STRATA_ADAPT_NOWAIT", "1"},        // the window starts before the adaptive tier's copies land (P100 -10 points when removed)
+            {"STRATA_ADAPT_LAG", "2"},           // the window takes the tier's swaps two windows old (P100 +3.5%)
+            {"STRATA_CPU_IQ_ALL_EXACT1", "1"},   // one-token AVX2 rows with ggml's float order; the P40 host has AVX2 and no AVX-512
+            {"STRATA_SIDE_MIXER", "2"},          // the mixer's input-only work on graph branches; no arithmetic changes (P100 -1.8)
+            {"STRATA_FUSE_WAIT", "2"},           // the plan's wait folded into the copy after it (P100 -1.6)
+            {"STRATA_B6_MMVQ_ROWS", "1"},        // the exact multi-column matvec with the activation fragment reused (P100 -1.3)
+            {"STRATA_FUSE_DECODE", "1"},         // PR #1097's operator fusions; compiled only into the CUDA 12 Pascal engine (P100 -1.3)
+            {"STRATA_GR_UP75", "1"},             // the hyper-connection up read for 3+ tokens; bitwise gr_up_multi_kernel
+            {"STRATA_ATTN_DAILY", "1"},          // PR #540's chunk kernel is already the sm_61 default here; this adds the bitwise v2 merge
+            {"STRATA_QSA_ROWS", "1"},            // the block scorer up to 4 queries in registers; the same bits
+        };
     } else if (mj == 12 && mn == 1) {
         // GB10 (NVIDIA DGX Spark, 48 SMs, unified memory): only what was measured on that part goes in.  New in 0.2.7.1, so
         // STRATA_DEFAULTS=026 (the master switch of everything since 0.2.6) leaves the table out, like STRATA_SM121_PERF=0.
@@ -97,12 +115,13 @@ std::vector<std::string> apply_nv_defaults(int major, int minor) {
     }
     if (!set.empty()) {
         const bool sm86 = mj == 8;
+        const bool sm61 = mj == 6 && mn == 1;
         const bool sm121 = mj == 12 && mn == 1;
-        // sm_86 / sm_60: bit-exact switches.  sm_121: the fused prompt path and the FP4-activation NVFP4 prompt round differently from the
+        // sm_86 / sm_60 / sm_61: bit-exact switches.  sm_121: the fused prompt path and the FP4-activation NVFP4 prompt round differently from the
         // paths they replace (24 of 24 greedy answers were identical on the Spark; no KL run), so the line does not say "exact".
         std::fprintf(stderr, "strata: %s: %zu %sspeed switches on by default (%s=0 turns them off%s; a switch you set is kept): ",
-                     sm86 ? "sm_86 (Ampere)" : sm121 ? "sm_121 (GB10)" : "sm_60 (Pascal)", set.size(), sm121 ? "" : "exact ",
-                     sm86 ? "STRATA_SM86_PERF" : sm121 ? "STRATA_SM121_PERF" : "STRATA_SM60_PERF",
+                     sm86 ? "sm_86 (Ampere)" : sm61 ? "sm_61 (Pascal, P40)" : sm121 ? "sm_121 (GB10)" : "sm_60 (Pascal)", set.size(), sm121 ? "" : "exact ",
+                     sm86 ? "STRATA_SM86_PERF" : sm61 ? "STRATA_SM61_PERF" : sm121 ? "STRATA_SM121_PERF" : "STRATA_SM60_PERF",
                      sm121 ? ", as does STRATA_DEFAULTS=026" : "");
         for (size_t i = 0; i < set.size(); ++i) std::fprintf(stderr, "%s%s", i ? " " : "", set[i].c_str() + 7);
         std::fprintf(stderr, "\n");
