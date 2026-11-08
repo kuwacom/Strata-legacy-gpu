@@ -1,0 +1,58 @@
+diff --git a/src/core/expert_source.cpp b/src/core/expert_source.cpp
+index 4a872e8c..1c495baf 100644
+--- a/src/core/expert_source.cpp
++++ b/src/core/expert_source.cpp
+@@ -3196,6 +3196,40 @@ void RouterLookahead::stats_score(int64_t layer, const int32_t* ids, int64_t n,
+     }
+ }
+ 
++// 149-pool: the read-ahead's byte budget for one layer (STRATA_POOL_PREFETCH_MB, default 8 MiB - about six experts on
++// the IQ3_XXS pack, where a decode layer routes one to three of them outside the VRAM cache).
++static uint64_t pool_prefetch_budget() {
++    static const uint64_t mb = [] {
++        const char* v = std::getenv("STRATA_POOL_PREFETCH_MB");
++        const long n = v != nullptr ? std::atol(v) : 8;
++        return (uint64_t) (n > 0 ? n : 8);
++    }();
++    return mb << 20;
++}
++
++// 149-pool: the CPU pool's read-ahead.  The pool's workers read a layer's expert blobs only after that layer's router
++// has rung, and the GPU then waits for them at the end of the layer's FFN (the profile's `waitCPU`).  The prediction the
++// file tier already pays for names the next layer's CPU experts a layer early, so this touches their blobs now: the
++// DRAM read moves under the current layer's GPU work instead of onto the pool's own window.  It reads and discards -
++// no expert is computed, no weight is changed, and the output is the same bits with the read-ahead on or off.
++static void pool_warm_ahead(const ExpertSource* src, int64_t layer, const int64_t* experts, int64_t n, uint64_t budget) {
++    const FileExpertSource* fs = dynamic_cast<const FileExpertSource*>(src);
++    if (fs == nullptr || layer < 0 || n <= 0) return;
++    const uint64_t bytes = strata::kernels::cpu::expert_layout().blob_bytes(layer);
++    if (bytes == 0) return;
++    volatile uint8_t sink = 0;
++    uint64_t used = 0;
++    for (int64_t j = 0; j < n && used + bytes <= budget; ++j) {
++        const uint8_t* b = fs->resident_blob(layer, experts[j]);   // the RAM copy only: a file-tier read is warm's job
++        if (b == nullptr) continue;
++        // one line at a time: a sequential read of the blob lands in this core's L2 (4 MiB) and the shared L3, where
++        // the pool's workers then hit instead of going to DRAM.  The sink defeats the compiler's dead-store removal.
++        for (uint64_t o = 0; o < bytes; o += 64) sink ^= b[o];
++        used += bytes;
++    }
++    (void) sink;
++}
++
+ void RouterLookahead::run() {
+     std::vector<float> logits((size_t) (8 * n_expert_));
+     std::vector<int32_t> order((size_t) n_expert_);
+@@ -3314,6 +3348,12 @@ void RouterLookahead::run() {
+         if (fs != nullptr && dj == 0)   // the next layer only: a deeper guess is too often wrong to spend a copy on
+             for (const int64_t e : want) fs->predict(src_, layer, (int32_t) e);
+         predicted_.fetch_add((int64_t) want.size(), std::memory_order_relaxed);
++        // 149-pool: the next layer's CPU experts are read ahead now, under this layer's GPU work (see pool_warm_ahead)
++        if (dj == 0) {
++            static const bool pool_pf = [] { const char* v = std::getenv("STRATA_POOL_PREFETCH"); return v != nullptr && v[0] != '0'; }();
++            if (pool_pf && !want.empty())
++                pool_warm_ahead(src_, layer, want.data(), (int64_t) want.size(), pool_prefetch_budget());
++        }
+         }
+         busy_us_.fetch_add((uint64_t) std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count(),
+                            std::memory_order_relaxed);
