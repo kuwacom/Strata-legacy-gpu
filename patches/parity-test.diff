@@ -1,0 +1,78 @@
+diff --git a/src/kernels/native_multi_parity.cpp b/src/kernels/native_multi_parity.cpp
+index 8c925ad9..a3c22d20 100644
+--- a/src/kernels/native_multi_parity.cpp
++++ b/src/kernels/native_multi_parity.cpp
+@@ -93,6 +93,73 @@ int main(int argc, char**) {
+         bad += mode_bad;
+     }
+ 
++    // ---- the n == 1 router with the doorbell folded into the top-10 launch (route_publish): ids and weights
++    // must be native_router_top10's bits; the mapped rows and the ring must be doorbell_publish_res's.  Both
++    // residency outcomes (all resident: the rows stay untouched; a miss: x is copied).
++    for (int mode = 0; mode < 3; ++mode) {
++        const char* names[] = {"random logits", "exact ties", "NaN logits"};
++        const int n_embd = mode == 2 ? 7 : 2560;   // an odd width too: the copy is not float4-sized
++        std::vector<float> lg(512), xv((size_t) n_embd);
++        for (auto& v : lg) v = gauss(rng) * 2.0f;
++        if (mode == 1)
++            for (auto& v : lg) v = (float) (int) (v * 2.0f) * 0.5f;
++        if (mode == 2) lg[rng() % 512] = std::nanf("");
++        for (auto& v : xv) v = gauss(rng);
++        float* d_l = up(lg);
++        float* d_x = up(xv);
++        int32_t* d_ir;
++        float* d_wr;
++        int32_t* d_i;
++        float* d_w;
++        check(cudaMalloc(&d_ir, 10 * 4), "ir");
++        check(cudaMalloc(&d_wr, 10 * 4), "wr");
++        check(cudaMalloc(&d_i, 10 * 4), "i");
++        check(cudaMalloc(&d_w, 10 * 4), "w");
++        native_router_top10(d_l, d_ir, d_wr, st);
++        check(cudaDeviceSynchronize(), "sync ref");
++        const auto ri = down(d_ir, 10);
++        const auto rw = down(d_wr, 10);
++        int32_t* d_io = nullptr;
++        float* d_xo = nullptr;
++        uint32_t* d_seq = nullptr;
++        check(cudaMalloc(&d_io, 10 * 4), "io");
++        check(cudaMalloc(&d_xo, (size_t) n_embd * 4), "xo");
++        check(cudaMalloc(&d_seq, 4), "seq");
++        std::vector<int32_t> res(512, 0);
++        int32_t* d_res = up(res);
++        uint32_t zero = 0;
++        check(cudaMemcpy(d_seq, &zero, 4, cudaMemcpyHostToDevice), "seq0");
++        const std::vector<float> sentinel((size_t) n_embd, -12345.0f);
++        int pbad = 0;
++        for (int miss = 0; miss < 2; ++miss) {
++            std::vector<int32_t> res2(512, 0);
++            if (miss) res2[(size_t) ri[0]] = -1;
++            check(cudaMemcpy(d_res, res2.data(), res2.size() * 4, cudaMemcpyHostToDevice), "res");
++            check(cudaMemcpy(d_xo, sentinel.data(), sentinel.size() * 4, cudaMemcpyHostToDevice), "sent");
++            native_router_top10_publish(d_l, d_i, d_w, d_x, d_res, 512, n_embd, 10, d_xo, d_io, d_seq, st);
++            check(cudaDeviceSynchronize(), "sync fused");
++            const std::vector<int32_t> fi = down(d_i, 10), fio = down(d_io, 10);
++            const std::vector<float> fw = down(d_w, 10);
++            const auto fo = down(d_xo, (size_t) n_embd);
++            uint32_t seq1 = 0;
++            check(cudaMemcpy(&seq1, d_seq, 4, cudaMemcpyDeviceToHost), "seq1");
++            if (std::memcmp(fi.data(), ri.data(), 10 * 4) != 0 || std::memcmp(fw.data(), rw.data(), 10 * 4) != 0 ||
++                std::memcmp(fio.data(), ri.data(), 10 * 4) != 0)
++                ++pbad;
++            if (miss) {
++                if (std::memcmp(fo.data(), xv.data(), xv.size() * 4) != 0) ++pbad;
++            } else {
++                if (std::memcmp(fo.data(), sentinel.data(), sentinel.size() * 4) != 0) ++pbad;
++            }
++            if (seq1 != (uint32_t) (miss + 1)) ++pbad;
++        }
++        std::printf("  %-52s %s\n", (std::string("router+publish n=1, ") + names[mode]).c_str(),
++                    pbad ? "*** NO ***" : "bitwise (ids, weights, rows, ring)");
++        bad += pbad;
++        cudaFree(d_l); cudaFree(d_x); cudaFree(d_ir); cudaFree(d_wr);
++        cudaFree(d_i); cudaFree(d_w); cudaFree(d_io); cudaFree(d_xo); cudaFree(d_seq); cudaFree(d_res);
++    }
++
+     // ---- #1357: a model that does not have 512 experts takes the generic router (the native one reads 512 floats a
+     // row, so mtp.cpp's per-token call is guarded by n_expert == 512 like its siblings): router_top10 on 256-wide
+     // rows picks the host reference's ids in order, with its renormalised softmax weights

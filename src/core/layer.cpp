@@ -437,6 +437,26 @@ if (db != nullptr && g_publish_kernel) {
 // write idempotent across replays of the same graph - a captured literal would ring the same number
 // forever and the host would never see a change.
 strata::kernels::doorbell_ring(db->d_seq, stream);    }    return true;}
+// The verify window's n == 1 routing: the same GEMV and top-10 as `moe_route`, with the publish folded into the
+// top-10 launch.  Only the ring/rows move; the ids and weights are the top-10's bits (route_publish).
+bool moe_route_publish(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k,
+                       const MoEBuffers& b, const float* x, const int32_t* d_res, int n_expert,
+                       float* x_out, int32_t* ids_out, uint32_t* seq, void* stream, std::string& err) {
+    using namespace strata::kernels;
+    const LayerView v(tables, layer);
+    const WeightRef* w_router = v.get("ffn_gate_inp.weight");
+    if (w_router == nullptr) { err = v.name("ffn_gate_inp.weight") + " is missing"; return false; }
+    if (!native_bf16_projections) f32_to_bf16_bulk(x, b.x_bf16, g.n_embd, stream);
+    project_bf16(x, b.x_bf16, (const uint16_t*) w_router->data, b.logits, g.n_embd, g.n_expert, true, stream);
+    try {
+        native_router_top10_publish(b.logits, b.ids, b.weights, x, d_res, n_expert, (int) g.n_embd, (int) k,
+                                    x_out, ids_out, seq, stream);
+    } catch (const std::exception& error) {
+        err = v.name("router") + ": " + error.what();
+        return false;
+    }
+    return true;
+}
 // The verify window's routing: n tokens' logits in one BF16 projection and their top-k in one launch, each token
 // bitwise what `moe_route` gives it (the projection is the same kernel per column, the top-k kernel is per token).
 // Anything else (a native router, the canonical BF16 GEMVs, a doorbell) takes the per-token `moe_route`.
