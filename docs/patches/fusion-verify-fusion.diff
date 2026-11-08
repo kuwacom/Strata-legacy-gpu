@@ -1,0 +1,98 @@
+diff --git a/src/core/verify.cpp b/src/core/verify.cpp
+index 47977c15..6f8b77d1 100644
+--- a/src/core/verify.cpp
++++ b/src/core/verify.cpp
+@@ -451,7 +451,20 @@ bool fuse_wait_on() {
+     // block of the copy poll the flag over PCIe and was -1.5 % there, so it stays opt-in.
+     static const int env = [] { const char* v = std::getenv("STRATA_FUSE_WAIT"); return v != nullptr ? std::atoi(v) : -1; }();
+     if (env >= 0) return env == 1 || env == 2;
+-    return device_is_sm75();
++    if (device_is_sm75()) return true;
++    // P40 (sm_61): the plan's wait and its copy in one node (the same reads).  The rows' version stays opt-in:
++    // every row block polls the flag over PCIe.
++    static int per_dev[64];   // 0 unknown, 1 no, 2 yes
++    int dev = 0;
++    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
++    if (!per_dev[dev]) {
++        int maj = 0, mnr = 0;
++        const bool ok = cudaDeviceGetAttribute(&maj, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
++                        cudaDeviceGetAttribute(&mnr, cudaDevAttrComputeCapabilityMinor, dev) == cudaSuccess;
++        if (!ok) cudaGetLastError();
++        per_dev[dev] = ok && maj == 6 && mnr == 1 ? 2 : 1;
++    }
++    return per_dev[dev] == 2;
+ #endif
+ }
+ // 143-amdk's rows version of the folded wait (copy_rows_from_mapped_after): HIP with fuse_wait_on, CUDA STRATA_FUSE_WAIT=1
+@@ -1424,8 +1437,15 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+         in_s = df_side_[1];
+         inputs_pending = true;
+     }
+-    copy_i32_from_mapped(step_, m_step_, (int64_t) T * kStepCount, in_s);
+-    copy_i32_from_mapped(pos_, m_pos_, (int64_t) MT * (NH + NKV + IQ), in_s);
++    {
++        // the window's three staging reads in one launch (copy_from_mapped_multi): the same words, two nodes fewer
++        strata::kernels::MappedCopy in_copies[3] = {
++            {tok_, m_tok_, T},
++            {step_, m_step_, (int64_t) T * kStepCount},
++            {pos_, m_pos_, (int64_t) MT * (NH + NKV + IQ)},
++        };
++        strata::kernels::copy_from_mapped_multi(in_copies, 3, in_s);
++    }
+     // per-ROW positions of the K rows [t][NKV] and the indexer query rows [t][IQ] (for batched RoPE)
+     const int32_t* pos_k = pos_ + MT * NH;
+     const int32_t* pos_i = pos_ + MT * (NH + NKV);
+@@ -2196,6 +2216,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+         // move into the combine, gate + up share one launch (all bitwise; resident combine path, 2-8 rows only)
+         const WeightRef* w_sgi = lfuse_on(n) && g_lfuse_gate() ? v.get("ffn_gate_inp_shexp.weight") : nullptr;
+         bool sg_ready = false;
++        bool route_published = false;   // the n == 1 router's fused launch published this group (route_publish)
+         if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10) {
+             try {
+                 if (w_sgi != nullptr)
+@@ -2216,11 +2237,23 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+                                   cs, err))
+                 return false;
+ #endif
+-        } else
++        } else {
++        // the window's single row: the top-10 and the doorbell publish in one node (route_publish).  Only when the
++        // publish is the plain doorbell_publish_res path - route_prior / route_resident rewrite the ids after it.
++        const bool fuse_pub = n == 1 && NE == 512 && K == 10 && native_router_enabled() && !remote_opt_ &&
++                              !always_publish_ && !ar_on() && g_route_prior() <= 0.0f &&
++                              route_resident_cfg().margin <= 0.0f;
+         for (int t = tb; t < te; ++t) {
+             MoEBuffers mb = ss.moe;
+             mb.logits = logits_ + t * NE; mb.ids = ids_ + t * K; mb.weights = w_ + t * K;
+-            if (!moe_route(wt, g, l, K, mb, mixed_ + t * N, cs, err, nullptr)) return false;
++            if (fuse_pub) {
++                const int32_t* layer_res = hits_.d_res != nullptr ? (hits_.d_res + l * g.n_expert) : nullptr;
++                if (!moe_route_publish(wt, g, l, K, mb, mixed_ + t * N, layer_res, (int) g.n_expert,
++                                       m_x_ + tb * N, m_ids_ + tb * K, m_seq_, cs, err))
++                    return false;
++                route_published = true;
++            } else if (!moe_route(wt, g, l, K, mb, mixed_ + t * N, cs, err, nullptr)) return false;
++        }
+         }
+         strata::dispatch::notef("router layer: batched native router=%ld, shared-expert gate in the router launch=%ld, route_prior=%ld", (long) (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10), (long) sg_ready, (long) (g_route_prior() > 0.0f));
+         // STRATA_ROUTE_PRIOR=lambda (changes the output): the top-10 picked again with a logit bonus for the resident
+@@ -2258,7 +2291,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+ #endif
+             // #578: the helper GPUs reduce with the routing weights - publish them; set_always_publish: the rows
+             // whatever the device's residency table says (pipelined windows)
+-            if (remote_opt_ || always_publish_)
++            if (route_published) {
++                // the n == 1 router's fused launch already published this group (route_publish)
++            } else if (remote_opt_ || always_publish_)
+                 doorbell_publish(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
+                                  m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);
+             else {
+@@ -2843,7 +2878,7 @@ bool Verifier::capture(int T, std::string& err) {
+         for (auto& [k2, c] : kinds) v.push_back({c, k2});
+         std::sort(v.rbegin(), v.rend());
+         std::fprintf(stderr, "strata verify: the %d-token window graph has %zu nodes:", T, nn);
+-        for (size_t i = 0; i < v.size() && i < 40; ++i) std::fprintf(stderr, " %d x %.60s;", v[i].first, v[i].second.c_str());
++        for (size_t i = 0; i < v.size() && i < 200; ++i) std::fprintf(stderr, "\n %4d x %s", v[i].first, v[i].second.c_str());
+         std::fprintf(stderr, "\n");
+ #if CUDART_VERSION >= 12030   // the programmatic (PDL) edges: CUDA allows them only from a kernel node to a kernel node
+         size_t ne = 0;

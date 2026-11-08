@@ -95,3 +95,8 @@ node_modules/
 /build-spark/
 /build-vision-spark/
 /.venv-build/
+
+# Local build outputs and machine-specific work products
+engines/
+*.part
+/results/
