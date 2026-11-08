@@ -159,8 +159,12 @@ int main() {
                 product(ctx, s, ("Q6_K gate/up" + tag).c_str(), GGML_TYPE_Q6_K, 1280, 2560, counts, trial + 17);
                 product(ctx, s, ("Q5_1 down" + tag).c_str(), GGML_TYPE_Q5_1, 2560, 640, counts, trial + 9);
                 product(ctx, s, ("Q8_0 down" + tag).c_str(), GGML_TYPE_Q8_0, 2560, 640, counts, trial + 13);
+                // Q3_K: the dense GDN projections' type (STRATA_DENSE_MMQ on CUDA), at their gate/up shape
+                product(ctx, s, ("Q3_K gate/up" + tag).c_str(), GGML_TYPE_Q3_K, 1280, 2560, counts, trial + 23);
                 ++trial;
             }
+            // the dense qkv shape itself (10240 rows, 2560 columns): two experts of one row each
+            product(ctx, s, "Q3_K qkv dense", GGML_TYPE_Q3_K, 10240, 2560, {1, 1}, 41);
         }
         ck(cudaStreamDestroy(s), "destroy");
         std::printf("prefill MMQ K-quant screen passed\n");

@@ -1,5 +1,5 @@
 // src/prefill/mmq_kq_lib.cu - strata_kq, the shared library with llama.cpp's MMQ prompt kernels for the K-quants
-// (Q4_K, Q5_K, Q5_1, Q6_K: the experts of Unsloth's UD-Q4/Q5/Q6_K_XL files).  MODEL-UPDATE Phase 1: the engine loads
+// (Q4_K, Q5_K, Q5_1, Q6_K: the experts of Unsloth's UD-Q4/Q5/Q6_K_XL files; Q3_K: the dense projections' STRATA_DENSE_MMQ).  MODEL-UPDATE Phase 1: the engine loads
 // every kernel of its own binary when it starts (CUDA_MODULE_LOADING=EAGER, src/program/generate.cpp), so kernels in
 // the engine cost every model VRAM; these four instances were ~3.8 MB of sm_60 code (3 expert slots of IQ3_XXS on a
 // P100).  Here they load only when moe_mmq.cu opens this library - for a model with these experts, before the expert
@@ -54,6 +54,7 @@ STRATA_KQ_EXPORT int strata_kq_run(int device, int type, const void* args, void*
         case GGML_TYPE_Q5_K: mul_mat_q_case<GGML_TYPE_Q5_K>(ctx, a, s); break;
         case GGML_TYPE_Q5_1: mul_mat_q_case<GGML_TYPE_Q5_1>(ctx, a, s); break;
         case GGML_TYPE_Q6_K: mul_mat_q_case<GGML_TYPE_Q6_K>(ctx, a, s); break;
+        case GGML_TYPE_Q3_K: mul_mat_q_case<GGML_TYPE_Q3_K>(ctx, a, s); break;   // the dense projections (STRATA_DENSE_MMQ)
         default: return -1;
     }
     return (int) cudaGetLastError();
