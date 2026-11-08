@@ -1,0 +1,58 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index d273c7c4..6ddd85cb 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -2333,7 +2333,13 @@ if(STRATA_NATIVE_EXPERTS)
+       set(_strata_kq_dso ON)
+     endif()
+     foreach(_t IN LISTS _strata_mmq_cuda_types)
+-      target_sources(strata_mmq PRIVATE ${_strata_mmq}/template-instances/mmq-instance-${_t}.cu)
++      # the overlay's instance when it has one: a patched MMQ config (the Pascal I tile) only reaches a type's
++      # kernels through an instance compiled beside it (the pinned file includes "../mmq.cuh" from its own folder)
++      set(_inst "${_strata_mmq}/template-instances/mmq-instance-${_t}.cu")
++      if(_strata_mmq_tq_overlay AND EXISTS "${_strata_tq_overlay_dir}/template-instances/mmq-instance-${_t}.cu")
++        set(_inst "${_strata_tq_overlay_dir}/template-instances/mmq-instance-${_t}.cu")
++      endif()
++      target_sources(strata_mmq PRIVATE ${_inst})
+     endforeach()
+     if(_strata_mmq_tq_overlay)
+       foreach(_t tq2_t tqk6 tqk7 tqp5 tqp6 tqp7)
+diff --git a/cmake/strata_ggml_tq_overlay.cmake b/cmake/strata_ggml_tq_overlay.cmake
+index a29ae4be..1f32099f 100644
+--- a/cmake/strata_ggml_tq_overlay.cmake
++++ b/cmake/strata_ggml_tq_overlay.cmake
+@@ -144,8 +144,33 @@ function(strata_ggml_tq_overlay LLAMA OUT)
+     file(WRITE "${OUT}/${_cn}" "${_t}")
+   endforeach()
+ 
++  # ---- mmq-config-pascal-dp4a.cuh: the DP4A MMQ I tile 128 for J=64, 48 and 40 (llama.cpp #31352) -------------------
++  # sm_61's 48 KB of shared memory holds an I=128 tile for the non-K types at J=64 (GTX 1080 Ti: +8.2..18.0 % pp512,
++  # MUL_MAT 2490/2490); I>=192 does not compile and the K-quants regress 18-37 %, so they keep I=64.
++  # J=48 and J=40 (the fallback=false CASEs only) are the tile the scheduler picks for 81..96 and 41..80 rows per
++  # expert group: halving their row tiles is the same win, and both fit (44,864 B at J=48, 43,648 B at J=40).
++  # IQ2_XS / IQ2_S keep I=64 at J=64: their Q8_0_16 tile is 51,200 B at I=128 (over 49,152 B), and I=96 (40,768 B,
++  # fits) leaves 1280 % 96 = 32 rows in the last tile, which the fallback=false kernel (nrows_x % 128 == 0) writes
++  # past nrows_x: compute-sanitizer reports the out-of-bounds accesses even though the numeric screen passes.
++  set(_p "${OUT}/mmq-config-pascal-dp4a.cuh")
++  if(EXISTS "${_p}")
++    file(READ "${_p}" _pd)
++    foreach(_ty Q1_0 Q2_0 Q4_0 Q4_1 Q5_0 Q5_1 Q8_0 IQ2_XXS IQ3_XXS IQ3_S IQ4_XS IQ4_NL)
++      foreach(_j 64 48 40)
++        string(REPLACE "CASE(GGML_TYPE_${_ty}, 256, 2, 64,  ${_j}," "CASE(GGML_TYPE_${_ty}, 256, 2, 128,  ${_j}," _pd "${_pd}")
++        string(FIND "${_pd}" "CASE(GGML_TYPE_${_ty}, 256, 2, 128,  ${_j}," _hit)
++        if(_hit LESS 0)
++          set(_tq_fail "the DP4A MMQ config has no J=${_j} CASE for ${_ty}: the I tile 128 is not applied")
++        endif()
++      endforeach()
++    endforeach()
++    file(WRITE "${_p}" "${_pd}")
++  endif()
++
+   # ---- template instances -------------------------------------------------------------------------------------------
+-  foreach(_ty tq2_t tqk6 tqk7 tqp5 tqp6 tqp7)
++  # the trellis types, and the pinned nine re-compiled here: an instance's "../mmq.cuh" resolves beside the instance
++  # file, so a patched MMQ config only reaches a type's kernels through an instance that sits next to it
++  foreach(_ty tq2_t tqk6 tqk7 tqp5 tqp6 tqp7 q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0)
+     string(TOUPPER "${_ty}" _TY)
+     file(WRITE "${OUT}/template-instances/mmq-instance-${_ty}.cu"
+          "// Strata trellis overlay (cmake/strata_ggml_tq_overlay.cmake)\n\n#include \"../mmq.cuh\"\n\nDECL_MMQ_CASE(GGML_TYPE_${_TY});\n")

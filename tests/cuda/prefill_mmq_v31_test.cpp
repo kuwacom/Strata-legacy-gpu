@@ -94,7 +94,7 @@ void product(mmq::Context& ctx, cudaStream_t s, const char* name, ggml_type t, i
         ws.push_back(make_matrix(t, out_rows, cols, e, trial));
         std::copy(ws.back().begin(), ws.back().end(), w.begin() + (ptrdiff_t) ((size_t) e * eb));
     }
-    Dev dx(x.size() * 4), dsrc((size_t) rows * 4), ddst((size_t) rows * 4), db(bounds.size() * 4), dw(w.size()),
+    Dev dx(x.size() * 4), dsrc((size_t) rows * 4), ddst((size_t) rows * 4 + 256), db(bounds.size() * 4), dw(w.size()),
         dxq(mmq::q8_bytes(rows, cols)), dy((size_t) rows * (size_t) out_rows * 4);
     ck(cudaMemcpy(dx.p, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "x");
     ck(cudaMemcpy(dsrc.p, src.data(), src.size() * 4, cudaMemcpyHostToDevice), "src");
@@ -265,11 +265,15 @@ int main(int argc, char** argv) {
         int skipped = 0;
         {
             mmq::Context ctx;
-            const std::vector<std::vector<int>> batches{{1, 3, 3}, {4, 1, 2}, {2, 3}, {17}};
+            // {64} and {80} land on the J=64 DP4A tile, the one the sm_61 I=128 config (llama.cpp #31352) changes:
+            // 64 rows is one tile, 80 rows a tile and a 16-row remainder.  v3 also changes J=48 and J=40, which the
+            // scheduler picks for 41..96 rows: {48} and {96} are two and three J=48 tiles, {80} two J=40 tiles.
+            const std::vector<std::vector<int>> batches{{1, 3, 3}, {4, 1, 2}, {2, 3}, {17}, {48}, {64}, {80}, {96}};
             struct Case { const char* name; ggml_type t; int64_t out_rows, cols; int salt; };
             const Case cases[] = {
                 {"IQ2_XXS gate/up", GGML_TYPE_IQ2_XXS, 1280, 2560, 0}, {"IQ2_XS gate/up", GGML_TYPE_IQ2_XS, 1280, 2560, 3},
                 {"IQ2_S gate/up", GGML_TYPE_IQ2_S, 1280, 2560, 5},     {"IQ3_XXS gate/up", GGML_TYPE_IQ3_XXS, 1280, 2560, 7},
+                {"IQ3_S gate/up", GGML_TYPE_IQ3_S, 1280, 2560, 29},    // the v2 type: its J=64 tile is I=128
                 {"IQ4_XS gate/up", GGML_TYPE_IQ4_XS, 1280, 2560, 11},  {"Q2_0 down", GGML_TYPE_Q2_0, 2560, 640, 13},
                 {"IQ4_NL down", GGML_TYPE_IQ4_NL, 2560, 640, 17},      {"Q8_0 down", GGML_TYPE_Q8_0, 2560, 640, 19},
                 {"Q5_0 down", GGML_TYPE_Q5_0, 2560, 640, 23},
