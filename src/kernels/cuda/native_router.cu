@@ -148,6 +148,86 @@ __global__ void route_multi(const float* __restrict__ logits, int32_t* __restric
     const float inverse_selected_sum = 1.0f / selected_sum;
     if (lane < 10) weights[lane] = selected * inverse_selected_sum;
 }
+// The verify window's n == 1 router with the CPU pool's doorbell in the same launch: warp 0 computes the
+// top-10 exactly as `route` does, then the block publishes x/ids to mapped host memory and rings the sequence.
+// One kernel node fewer per layer; the ids, weights, rows and ring are the separate launches' bytes.
+__launch_bounds__(256, 1)
+__global__ void route_publish(const float* __restrict__ logits, int32_t* __restrict__ ids,
+                              float* __restrict__ weights, const float* __restrict__ x,
+                              const int32_t* __restrict__ d_res, int n_expert, int n, int k,
+                              float* x_out, int32_t* ids_out, uint32_t* seq) {
+    __shared__ int any_miss;
+    const int lane = (int) threadIdx.x;
+    if (threadIdx.y == 0) {
+        float values[16];
+#pragma unroll
+        for (int i = 0; i < 16; ++i) values[i] = logits[lane + i * 32];
+        __syncwarp();
+        float maximum = -INFINITY;
+#pragma unroll
+        for (int i = 0; i < 16; ++i) maximum = max(maximum, values[i]);
+        maximum = warp_max(maximum);
+        float sum = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            values[i] = expf(values[i] - maximum);
+            sum += values[i];
+        }
+        const float reciprocal = 1.0f / warp_sum(sum);
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            values[i] *= reciprocal;
+            if (__isnanf(values[i])) values[i] = -FLT_MAX;
+        }
+        float selected = 0.0f, selected_sum = 0.0f;
+        for (int rank = 0; rank < 10; ++rank) {
+            float best = values[0];
+            int expert = lane;
+#pragma unroll
+            for (int i = 1; i < 16; ++i) {
+                if (values[i] > best) { best = values[i]; expert = lane + i * 32; }
+            }
+#pragma unroll
+            for (int mask = 16; mask; mask >>= 1) {
+                const float other = __shfl_xor_sync(0xffffffffu, best, mask, 32);
+                const int other_id = __shfl_xor_sync(0xffffffffu, expert, mask, 32);
+                if (other > best || (other == best && other_id < expert)) { best = other; expert = other_id; }
+            }
+            if ((expert & 31) == lane) {
+                values[expert / 32] = -INFINITY;
+                ids[rank] = expert;
+                selected_sum += best;
+            }
+            if (rank == lane) selected = best;
+        }
+        selected_sum = max(warp_sum(selected_sum), 6.103515625e-5f);
+        const float inverse_selected_sum = 1.0f / selected_sum;
+        if (lane < 10) weights[lane] = selected * inverse_selected_sum;
+    }
+    __syncthreads();
+    if (threadIdx.y == 0 && lane == 0) {
+        int miss = 0;
+        for (int r = 0; r < k; ++r) {
+            const int32_t id = ids[r];
+            ids_out[r] = id;
+            if (d_res == nullptr || id < 0 || id >= n_expert || d_res[id] < 0) miss = 1;
+        }
+        any_miss = miss;
+    }
+    __syncthreads();
+    const int tid = (int) threadIdx.y * 32 + (int) threadIdx.x;
+    if (any_miss) {
+        for (int i = tid; i < n; i += 256) x_out[i] = x[i];
+        __threadfence_system();
+    } else if (tid == 0) {
+        __threadfence_system();
+    }
+    __syncthreads();
+    if (tid == 0) {
+        *(volatile uint32_t*) seq = *(volatile uint32_t*) seq + 1u;
+        __threadfence_system();
+    }
+}
 // The same contract for other (experts, top-k) shapes - Qwen3.6-35B-A3B's 256 / 8 - one warp per token, n_tok tokens
 // (8 per block).  The 512 / 10 path keeps its own kernels above (the Flash-Next bits), this template is only used
 // for the other shapes.
@@ -230,6 +310,18 @@ void native_router_top10_multi(const float* logits, int32_t* ids, float* weights
         !valid(weights, (size_t) n_tok * 10 * 4))
         throw std::invalid_argument("native router (multi) requires a stream and aligned [n,512]/[n,10] buffers");
     route_multi<<<(unsigned) ((n_tok + 7) / 8), dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, weights, n_tok);
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+void native_router_top10_publish(const float* logits, int32_t* ids, float* weights, const float* x,
+                                 const int32_t* d_res, int n_expert, int n, int k, float* x_out,
+                                 int32_t* ids_out, uint32_t* seq, void* stream) {
+    if (!stream || n_expert != 512 || k != 10 || n < 1 || !valid(logits, 512 * 4) || !valid(ids, 10 * 4) ||
+        !valid(weights, 10 * 4) || !valid(x, (size_t) n * 4) || !valid(x_out, (size_t) n * 4) ||
+        !valid(ids_out, 10 * 4) || seq == nullptr)
+        throw std::invalid_argument("native router (publish) requires a stream, aligned spans and a ring");
+    route_publish<<<1, dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, weights, x, d_res, n_expert, n, k,
+                                                                             x_out, ids_out, seq);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }

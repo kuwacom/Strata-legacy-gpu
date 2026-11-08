@@ -1,0 +1,1301 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index d273c7c4..6ddd85cb 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -2333,7 +2333,13 @@ if(STRATA_NATIVE_EXPERTS)
+       set(_strata_kq_dso ON)
+     endif()
+     foreach(_t IN LISTS _strata_mmq_cuda_types)
+-      target_sources(strata_mmq PRIVATE ${_strata_mmq}/template-instances/mmq-instance-${_t}.cu)
++      # the overlay's instance when it has one: a patched MMQ config (the Pascal I tile) only reaches a type's
++      # kernels through an instance compiled beside it (the pinned file includes "../mmq.cuh" from its own folder)
++      set(_inst "${_strata_mmq}/template-instances/mmq-instance-${_t}.cu")
++      if(_strata_mmq_tq_overlay AND EXISTS "${_strata_tq_overlay_dir}/template-instances/mmq-instance-${_t}.cu")
++        set(_inst "${_strata_tq_overlay_dir}/template-instances/mmq-instance-${_t}.cu")
++      endif()
++      target_sources(strata_mmq PRIVATE ${_inst})
+     endforeach()
+     if(_strata_mmq_tq_overlay)
+       foreach(_t tq2_t tqk6 tqk7 tqp5 tqp6 tqp7)
+diff --git a/cmake/strata_ggml_tq_overlay.cmake b/cmake/strata_ggml_tq_overlay.cmake
+index a29ae4be..dc5f9bb2 100644
+--- a/cmake/strata_ggml_tq_overlay.cmake
++++ b/cmake/strata_ggml_tq_overlay.cmake
+@@ -144,8 +144,28 @@ function(strata_ggml_tq_overlay LLAMA OUT)
+     file(WRITE "${OUT}/${_cn}" "${_t}")
+   endforeach()
+ 
++  # ---- mmq-config-pascal-dp4a.cuh: the DP4A MMQ I tile 128 for J=64 (llama.cpp #31352) -------------------------------
++  # sm_61's 48 KB of shared memory holds an I=128 tile for the non-K types at J=64 (GTX 1080 Ti: +8.2..18.0 % pp512,
++  # MUL_MAT 2490/2490); I>=192 does not compile and the K-quants regress 18-37 %, so they keep I=64.
++  # IQ3_S is added here (its tile is 46,976 B at I=128). IQ2_XS / IQ2_S keep I=64: their Q8_0_16 tile is
++  # 51,200 B at I=128, over sm_61's 49,152 B, and the J=64 config would then be skipped for a 2-tile J=48.
++  set(_p "${OUT}/mmq-config-pascal-dp4a.cuh")
++  if(EXISTS "${_p}")
++    file(READ "${_p}" _pd)
++    foreach(_ty Q1_0 Q2_0 Q4_0 Q4_1 Q5_0 Q5_1 Q8_0 IQ2_XXS IQ3_XXS IQ3_S IQ4_XS IQ4_NL)
++      string(REPLACE "CASE(GGML_TYPE_${_ty}, 256, 2, 64,  64," "CASE(GGML_TYPE_${_ty}, 256, 2, 128,  64," _pd "${_pd}")
++      string(FIND "${_pd}" "CASE(GGML_TYPE_${_ty}, 256, 2, 128,  64," _hit)
++      if(_hit LESS 0)
++        set(_tq_fail "the DP4A MMQ config has no J=64 CASE for ${_ty}: the I tile 128 is not applied")
++      endif()
++    endforeach()
++    file(WRITE "${_p}" "${_pd}")
++  endif()
++
+   # ---- template instances -------------------------------------------------------------------------------------------
+-  foreach(_ty tq2_t tqk6 tqk7 tqp5 tqp6 tqp7)
++  # the trellis types, and the pinned nine re-compiled here: an instance's "../mmq.cuh" resolves beside the instance
++  # file, so a patched MMQ config only reaches a type's kernels through an instance that sits next to it
++  foreach(_ty tq2_t tqk6 tqk7 tqp5 tqp6 tqp7 q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0)
+     string(TOUPPER "${_ty}" _TY)
+     file(WRITE "${OUT}/template-instances/mmq-instance-${_ty}.cu"
+          "// Strata trellis overlay (cmake/strata_ggml_tq_overlay.cmake)\n\n#include \"../mmq.cuh\"\n\nDECL_MMQ_CASE(GGML_TYPE_${_TY});\n")
+diff --git a/docs/DETAILS.md b/docs/DETAILS.md
+index d2c0bb19..4c3d43b6 100644
+--- a/docs/DETAILS.md
++++ b/docs/DETAILS.md
+@@ -1284,6 +1284,7 @@ that one compute capability. The identity gate (10 prompts plus exact_pp 4K/20K,
+ | --- | --- | --- |
+ | sm_86 (RTX 3050-3090, RTX A2000-A6000) | `STRATA_ADAPT_NOWAIT=1`, `STRATA_ADAPT_LAG=2`, `STRATA_CPU_IQ_ALL_EXACT1=1`, `STRATA_SIDE_MIXER=2`, `STRATA_ATTN_DAILY=1`, `STRATA_GR_UP75=1`, `STRATA_GU_SWIGLU=1`, `STRATA_QSA_ROWS=1`, `STRATA_B6_MMVQ_ROWS=1` | `STRATA_SM86_PERF=0` |
+ | sm_60 (Tesla P100) | `STRATA_ADAPT_NOWAIT=1`, `STRATA_ADAPT_LAG=2`, `STRATA_SIDE_MIXER=2`, `STRATA_FUSE_WAIT=2`, `STRATA_B6_MMVQ_ROWS=1`, `STRATA_FUSE_DECODE=1`, `STRATA_GR_UP75=1` | `STRATA_SM60_PERF=0` |
++| sm_61 (Tesla P40) | `STRATA_ADAPT_NOWAIT=1`, `STRATA_ADAPT_LAG=2`, `STRATA_CPU_IQ_ALL_EXACT1=1`, `STRATA_SIDE_MIXER=2`, `STRATA_FUSE_WAIT=2`, `STRATA_B6_MMVQ_ROWS=1`, `STRATA_FUSE_DECODE=1`, `STRATA_GR_UP75=1`, `STRATA_ATTN_DAILY=1`, `STRATA_QSA_ROWS=1` | `STRATA_SM61_PERF=0` |
+ | sm_120 (RTX 50 and RTX PRO Blackwell) | `STRATA_SIDE_MIXER=2`, `STRATA_ATTN_DAILY=1`, `STRATA_GR_UP75=1`, `STRATA_GR_DOWN_TG=1`, `STRATA_GU_SWIGLU=1` | `STRATA_SM120_PERF=0` |
+ 
+ `STRATA_ADAPT_OVERLAP=1` does not run beside `STRATA_ADAPT_LAG` / `STRATA_ADAPT_NOWAIT`: set `STRATA_ADAPT_LAG=1
+diff --git a/docs/OLDER_GPUS.md b/docs/OLDER_GPUS.md
+index f3456c28..c247fd5f 100644
+--- a/docs/OLDER_GPUS.md
++++ b/docs/OLDER_GPUS.md
+@@ -253,8 +253,8 @@ the slots are filled. Only the CUDA build with `STRATA_EXPERIMENTAL_SM60` has th
+ 
+ ## Tesla P40 (sm_61): what was measured and changed
+ 
+-Three things run differently on compute capability 6.1 by default and a fourth is opt-in. Each gives the same bits as what it
+-replaces.
++Three things run differently on compute capability 6.1 by default, a fourth is opt-in, and ten scheduling switches are on by
++default (below). Each gives the same bits as what it replaces.
+ 
+ | Change | What it replaces | Switch |
+ | --- | --- | --- |
+@@ -270,6 +270,16 @@ library before you set it.
+ `STRATA_GR_FAST=1` is slower on the P40 below 5 tokens, and `STRATA_PREFILL_CPU_SHARE=auto` and `STRATA_ADAPT_OVERLAP=1` gave
+ nothing there.
+ 
++On a Tesla P40 the engine also turns on ten switches that change only how the work is scheduled, so answers stay bit for bit
++the same: `STRATA_ADAPT_NOWAIT=1`, `STRATA_ADAPT_LAG=2`, `STRATA_CPU_IQ_ALL_EXACT1=1`, `STRATA_SIDE_MIXER=2`,
++`STRATA_FUSE_WAIT=2`, `STRATA_B6_MMVQ_ROWS=1`, `STRATA_FUSE_DECODE=1`, `STRATA_GR_UP75=1`, `STRATA_ATTN_DAILY=1` and
++`STRATA_QSA_ROWS=1`. `STRATA_SM61_PERF=0` turns the whole set off, and a switch you set yourself, to any value, is kept. The
++set is used when every visible card has compute capability 6.1. The sm_86 set's `STRATA_GU_SWIGLU=1` is left out: the P40's
++default expert mode 8 already fuses gate/up, SwiGLU and the q8_1 blocks, and `STRATA_GU_SWIGLU` runs only on the CUDA expert
++layout. The full list and per-switch results are in
++[DETAILS.md](DETAILS.md#rtx-30-series-sm_86-and-tesla-p100-sm_60-bitwise-decode-switches-on-by-default) and
++[optimization/sm61-defaults.md](optimization/sm61-defaults.md).
++
+ Two things to know when measuring on such a card:
+ 
+ - **Temperature.** A P40 has no fan of its own. At 89 C the driver reports `SW Thermal Slowdown: Active` and the clock falls from
+diff --git a/docs/optimization/sm61-defaults.md b/docs/optimization/sm61-defaults.md
+new file mode 100644
+index 00000000..116e01aa
+--- /dev/null
++++ b/docs/optimization/sm61-defaults.md
+@@ -0,0 +1,189 @@
++# sm_61 (Tesla P40) の bitwise 既定スイッチ集合
++
++最終更新: 2026-11-06。作業ツリー `~/work/wt/defaults`（branch `perf/sm61-defaults`、フォーク HEAD `9f7d977d`）。
++数値はすべて実測。推定は「推定」と明記した。
++
++## 1. 概要
++
++`src/core/nv_defaults.cpp` は sm_86 / sm_60 / sm_121 の既定スイッチ集合を持つが、sm_61 (Tesla P40) の分岐が無かった。
++sm_60 (P100) で +17.8%（8/8）、sm_86 で +9.6〜14.6%（8/8）の bitwise な集合から、P40 のハード制約（dp4a あり、BF16 なし、
++48 KB shared / block、tensor core なし）で意味のあるものだけを sm_61 の既定にした。bitwise でないもの（`STRATA_HC_PERSIST`、
++`STRATA_ROUTE_TAIL_SKIP`、`STRATA_IQ_MT_MIN`）は既定にせず opt-in のまま残した。
++
++## 2. スイッチ表
++
++「bitwise の根拠」はコード内のコメントまたは docs の該当箇所。すべてのスイッチはユーザーが値を設定すればそれが優先され、
++`STRATA_SM61_PERF=0` で集合全体を切れる。
++
++| スイッチ | 何をするか | bitwise の根拠 | sm_61 の制約 | P40 での期待 | 採用 |
++|---|---|---|---|---|---|
++| `STRATA_ADAPT_NOWAIT=1` | adaptive tier のコピー完了を待たずに窓を開始する | 同じトークン（スケジューリングのみ）。`src/program/generate.cpp:1962-1964`、`docs/DETAILS.md:1073` | なし | P100 で外すと -10 points | 採用 |
++| `STRATA_ADAPT_LAG=2` | tier の swap を 2 窓前のものとして扱う | 同上。`generate.cpp:1972-1974`、`DETAILS.md:1074` | なし | P100 +3.5%（6/6） | 採用 |
++| `STRATA_CPU_IQ_ALL_EXACT1=1` | 1 token の AVX2 行を ggml の float 順で計算する | `src/kernels/cpu/native_expert.cpp:399-407`、`DETAILS.md:1094`（"the output does not change"） | ホストが AVX2 かつ AVX-512 なしのときだけ active。このホストは Xeon E5-2695 v4（AVX2、AVX-512 なし） | sm_86 で +0.4〜+2.5%（CPU pool 側） | 採用 |
++| `STRATA_SIDE_MIXER=2` | mixer の入力だけ読む仕事を graph の branch stream へ | `src/core/verify.cpp:259-263`（"bitwise the same outputs"） | CUDA のみ（HIP / Metal は 0） | P100 -1.8、sm_86 -1.2 / -2.3 | 採用 |
++| `STRATA_FUSE_WAIT=2` | plan の待ちを直後のコピーに畳む | `verify.cpp:436-452`（"same reads, same values, one kernel node fewer"） | CUDA のみ | P100 -1.6 | 採用 |
++| `STRATA_B6_MMVQ_ROWS=1` | 複数列 matvec で活性断片を 1 回だけ読み、行で再利用する | `src/kernels/cuda/native_mmvq.cu:1383`（"every output is bitwise the default exact layout's"） | exact layout（`g_multi_exact=true`）のときだけ。sm_61 の IL 表とは別経路 | P100 -1.3 | 採用 |
++| `STRATA_FUSE_DECODE=1` | PR #1097 の operator fusion（活性画像 1 pass、BF16 pair 射影、SwiGLU + q8_1） | `include/strata/kernels/fuse_decode.hpp:1-10`（"bitwise what the unfused sequences produce"） | `STRATA_EXPERIMENTAL_SM60` ビルドのみ。今回のビルドは ON | P100 -1.3。native pack では一部経路が no-op（codemap の指摘） | 採用（無害） |
++| `STRATA_GR_UP75=1` | GR up を 3 token 以上のとき別カーネルで読む | `src/kernels/cuda/fused_gr.cu:557`（"the same bits"）、`:1542`（"bitwise gr_up_multi_kernel"） | 3 token 以上のみ（`:1720`）。T1-2 は元の kernel | P100 -1.2、sm_75 で T3 27.3 -> 24.6 µs | 採用 |
++| `STRATA_ATTN_DAILY=1` | PR #540 の chunk kernel と v2 merge を使う | `src/kernels/cuda/qsa_decode_attn.cu:832`（"bit for bit the default kernel's partials"）、`:926`（v2 merge は "bitwise the same output"） | experimental build では chunk kernel は既に sm_61 既定。`ATTN_DAILY` は v2 merge を足す | sm_86 -1.2 / -1.3 | 採用 |
++| `STRATA_QSA_ROWS=1` | 4 query 以下の block score を register で計算する | `src/kernels/cuda/qsa_select.cu:2098`（"the same bits"） | NQ <= 4 のみ | sm_86 -0.5 / -1.2 | 採用 |
++| `STRATA_GU_SWIGLU=1` | gate/up + SwiGLU + q8_1 を 1 launch にする | `src/kernels/cuda/iq_kernels.cu:4249-4252`（"bitwise the same hq"） | **CUDA layout（`em0 == 0`）のみ**。sm_61 は expert mode 8 が既定で、gate/up + SwiGLU + q8_1 を既に融合している | sm_86 -0.8 / -1.4 | 不採用（mode 8 で inert） |
++| `STRATA_IQ_MT_MIN=1` | すべての group で multi-token CPU kernel を使う | 出力は drafting に依存しなくなるが、1 token の丸めが変わる（`native_expert.cpp:354-356`） | — | AVX-512 で -1〜-3% | 不採用（bitwise でない・減速） |
++| `STRATA_ROUTE_TAIL_SKIP` (7) | 全 token が rank 7 以下の missed expert を省く | `docs/DETAILS.md:1049`（"Answers differ slightly"） | CUDA ではアーキ表とは別に既定 on | 既に既定 on | 追加しない（bitwise でない・既に既定） |
++| `STRATA_EXPDEC=1` | 窓の活性を shared に置く expert gate/up | 2080 Ti で gate/up -11〜-23% の実測 | 48 KB に収まる | 期待薄（P40 は hit 99%） | 不採用（既定集合外の opt-in） |
++| `STRATA_HC_PERSIST=1` | GR read を persistent kernel 1 個にする | **bitwise でない**（別の和の順序） | 30 SM に 80 block | decode +4.5〜5% の可能性 | 不採用（opt-in のまま） |
++
++### 集合の設計
++
++- sm_60 の 7 個はすべて sm_61 でも意味がある（`ADAPT_*` は同じ tier、`SIDE_MIXER` / `FUSE_WAIT` / `FUSE_DECODE` は CUDA の
++  スケジューリング、`B6_MMVQ_ROWS` は exact matvec、`GR_UP75` は T>=3）ので全部入れた。
++- sm_86 の 9 個のうち、`CPU_IQ_ALL_EXACT1`（CPU pool）、`ATTN_DAILY`（PR #540）、`QSA_ROWS`（block score）は Pascal でも
++  動くので入れた。`GU_SWIGLU` は sm_61 の既定 expert mode 8 が同じ融合を既に持つため入れない。
++- 10 個すべてが bitwise。identity gate（10 prompt + exact_pp 4K/20K）は集合 on と off で一致する（本タスクでは GPU 時間の
++  都合で A/B の出力一致とパリティで代替。§7）。
++
++## 3. ビルド条件
++
++| 項目 | 値 |
++|---|---|
++| ソース | `~/work/wt/defaults`、HEAD `9f7d977d` + 本パッチ |
++| ggml / llama.cpp | ピン留めコミット `3cf03257`（`~/work/wt/build/third_party/llama.cpp` をコピー） |
++| ビルドコンテナ | `nvidia/cuda:12.9.1-devel-ubuntu24.04`、`--cpuset-cpus 36-47`、`-j 12` |
++| CUDA アーキ | `-DCMAKE_CUDA_ARCHITECTURES=61-real` のみ |
++| ホスト flags | `STRATA_PORTABLE=OFF`、C/CXX `-march=native`、CUDA ホスト `-Xcompiler=-march=native` |
++| 機能 flags | `STRATA_ENABLE_CUDA=ON`、`STRATA_EXPERIMENTAL_SM60=ON`、`STRATA_NATIVE_EXPERTS=ON`、`STRATA_Q6K_EXPERTS=ON`、`STRATA_MMQ_KQUANTS=ON`、`STRATA_BUILD_TESTS=ON` |
++| パリティ対象 | `nv_defaults_test`、`qsa_merge_daily_parity`、`qsa_rows_bench`、`mmvq_multi_parity`、`b6_mmvq_bench`、`native_grouped_parity`、`s2_expert_grouped_parity`、`mmvq_il_parity`、`dequant_wide_parity` |
++| 所要時間 | build 468 s / package 130 s / image 495 s（合計 1,093 s） |
++| ログ | `~/work/results/defaults/{build,package,image}-sm61-defaults.log` |
++| イメージ | `strata:fork-sm61-defaults`（746,995,355 bytes） |
++
++- コンパイラ警告のみ（未使用変数など）、エラー 0。
++- `nvcc` の sm_75 未満 offline compilation 非推奨警告は sm_61 の既知警告。
++
++## 4. パリティ
++
++GPU ロックを取り、本番を止めて VRAM を空けてから実行した（`~/work/results/defaults/parity-*.log`）。全 10 本 PASS。
++
++| テスト | 結果 | 何を確認したか |
++|---|---|---|
++| `nv_defaults_test` | ok | sm_61 表が 10 個、`STRATA_SM61_PERF=0` で空、`STRATA_DEFAULTS=026` の影響なし、6.2 は空 |
++| `qsa_merge_daily_parity`（既定） | 1,172 cases / 0 differ -> PASS | PR #540 chunk kernel と v2 merge が upstream と bit 一致（fp16 295 / int8 291 / q4_0 294 / k8v4 292） |
++| `qsa_merge_daily_parity`（`STRATA_ATTN_DAILY=1`） | 1,172 cases / 0 differ -> PASS | `ATTN_DAILY` の production entry が bit 一致 |
++| `qsa_rows_bench --rows` | 8 cases / 0 differ -> bit-identical | `QSA_ROWS` の scores と ids が multi kernel と bit 一致。scores は T=1 64.4 -> 61.7 µs、T=4 141.9 -> 125.7 µs |
++| `mmvq_multi_parity` | 148,480 outputs / 0 differ（multi_exact on） | exact multi-column が single-column と bit 一致。負の対照は 63,811 differ（T>4）で検査能力あり |
++| `b6_mmvq_bench` | 0 case/width comparisons failed | `B6_MMVQ_ROWS` が exact layout と bit 一致 |
++| `native_grouped_parity` | 0 failures | sm_61 の expert mode 8 が v1 と bit 一致（IQ3_S / IQ4_XS ほか） |
++| `s2_expert_grouped_parity` | 0 failures | grouped expert の slot stride / arena 経路が bit 一致 |
++| `mmvq_il_parity` | OK（T 1-8、rows 1/2/4 + table） | sm_61 の IL 表が bit 一致 |
++| `dequant_wide_parity` | 360 cases OK | sm_61 の wide dequant が bit 一致 |
++
++`GR_UP75` と `FUSE_DECODE` には専用の parity テストが無い。前者は `gr_up75_kernel` が `gr_up_multi_kernel` と同じ lane の和・
++xor 木・epilogue を使うこと（`fused_gr.cu:557`）と sm_75 / sm_120 の実測に基づく。後者は PR #1097 の各 fusion が
++`fuse_decode.hpp` で bitwise と明記され、sm_60 の既定集合で P100 実測（identity gate 一致）がある。
++
++## 5. 速度 A-B-A
++
++条件: `~/bench.py`、`BENCH_SEED=42`、4K/24K、max 256、spec=4 固定、`STRATA_DENSE_F32=1`、`--ple-io ram`、`--prefill auto`、
++`--kv int8`、`--kv-resident 32768`。A = `strata:fork-9f7d977-base`、B = `strata:fork-sm61-defaults`。各アーム 4 回、
++1 本目を捨てて残り 3 の中央値。A-B-A の 3 本目 (A2) は最初の測定が他エージェントの GPU コンテナと重なって汚染されたため、
++23:16 に再測した (A2b)。
++
++| 項目 | A1 | A2b | A 中央値 | B1 | B - A |
++|---|---:|---:|---:|---:|---:|
++| 4K code decode (tok/s) | 54.65 | 53.97 | 54.31 | 53.19 | -2.1% |
++| 4K prose decode | 43.76 | 42.84 | 43.30 | 44.49 | +2.7% |
++| 24K code decode | 50.29 | 48.22 | 49.26 | 51.39 | +4.3% |
++| 24K prose decode | 43.56 | 42.88 | 43.22 | 45.40 | +5.0% |
++| 4K code prefill | 460.9 | 465.0 | 463.0 | 463.9 | +0.2% |
++| 4K prose prefill | 440.0 | 437.6 | 438.8 | 443.8 | +1.1% |
++| 24K code prefill | 487.8 | 489.7 | 488.8 | 488.3 | -0.1% |
++| 24K prose prefill | 487.2 | 488.4 | 487.8 | 487.3 | -0.1% |
++
++- A 自身の揺れ (A1 vs A2b): 4K code 1.3%、4K prose 2.1%、24K code 4.3%、24K prose 1.6%。B の差はこの揺れと同程度〜やや上。
++- prefill は ±1% 以内（スイッチは decode のみ）。
++- 最初の A-B-A (A2 汚染) の値: A1 54.65 / 43.76 / 50.29 / 43.56、B1 53.19 / 44.49 / 51.39 / 45.40、
++  A2 49.16 / 40.64 / 48.54 / 36.64。A2 は 20:57 から他エージェントの GPU コンテナ (nvidia/cuda devel) と重なり、
++  4K prose が 20.43 / 22.73 tok/s、24K code の 1 本が prompt 0 / completion 27 で失敗した。汚染アームは判定に使わない。
++
++### decode の内訳 (`STRATA_DECODE_TIMING=1`、各アーム 1 回)
++
++| 項目 | A1 4K code | B1 4K code | A1 4K prose | B1 4K prose | A1 24K code | B1 24K code |
++|---|---:|---:|---:|---:|---:|---:|
++| window (ms) | 61.76 | 57.37 | 56.06 | 52.65 | 56.78 | 54.37 |
++| adapt wait | 1.76 | 0.02 | 1.28 | 0.02 | 1.31 | 0.02 |
++| verify | 49.47 | 47.84 | 50.67 | 49.57 | 95.29 | 48.79 |
++| GPU-reach wait | 39.62 | 37.65 | 42.39 | 41.68 | 61.06 | 41.04 |
++| per-layer host | 7.15 | 7.37 | 5.35 | 4.94 | 30.23 | 4.92 |
++| CPU experts | 6.45 | 6.63 | 4.64 | 4.28 | 29.00 | 4.27 |
++| draft | 4.29 | 4.44 | 4.39 | 4.50 | 5.44 | 4.49 |
++| avg T | 2.80 | 2.89 | 3.22 | 3.18 | 2.84 | 2.93 |
++
++- `ADAPT_NOWAIT` / `ADAPT_LAG` の効果が直接見える: adapt wait が 1.3〜1.8 ms/window から 0.02 ms へ。
++- 24K code の per-layer host CPU が 29.00 -> 4.27 ms に落ちている。`CPU_IQ_ALL_EXACT1` が AVX2 のみのホストで
++  ggml の single-token dot を置き換えるためと推定（推定）。
++- 24K prose の A1 timing は汚染された rep 4 (21.7 tok/s) のもので、clean な比較は無い。
++
++## 6. 出力一致
++
++固定 4 プロンプト (2K/8K/16K/24K、temp 0、max 128、thinking なし)。プロンプトは `bench.py` と同じ corpus と seed 42 で
++作り、アーム間で同一。実トークン数は 2,429 / 7,866 / 20,148 / 27,637。
++
++| 比較 | 2K | 8K | 16K | 24K |
++|---|---|---|---|---|
++| A1 vs A2 (既定 flags) | DIFFERENT | DIFFERENT | DIFFERENT | DIFFERENT |
++| A1 vs B1 (既定 flags) | DIFFERENT | DIFFERENT | DIFFERENT | DIFFERENT |
++| A1 vs A2 (identity flags) | IDENTICAL | DIFFERENT | DIFFERENT | DIFFERENT |
++| A1 vs B1 (identity flags) | DIFFERENT | DIFFERENT | DIFFERENT | DIFFERENT |
++
++- identity flags = `STRATA_IQ_MT_MIN=1 STRATA_PREFILL_CPU_SHARE=0 STRATA_ROUTE_TAIL_SKIP=0`（`docs/OLDER_GPUS.md:278` の推奨）。
++- このホストでは A 同士でも回答が変わる（AVX-512 なし CPU の既知の揺れ）。identity flags でも 8K/16K/24K で A1 と A2 が
++  違った。`--adapt-swaps 0 --pcie-frac 0 --prompt-cache 0` を併用していないため、adaptive tier の swap と会話キャッシュの
++  再利用が残ったことが原因と推定（推定、未確認）。
++- B の差分は A の揺れと同じ種類（同じ出だしから数十〜数百文字で語句が分岐）。最初の分岐位置は A1 vs A2 が 45 / 254 / 44 文字、
++  B が 291 / 82 / 254 / 33 文字で、B の差が A の揺れより大きいとは言えない。
++- したがってテキスト比較では「B は A の揺れと同程度」。bitwise の最終根拠は §4 のパリティ 10 本 PASS とコード内の宣言。
++
++## 7. 判定
++
++- decode の改善: 4K code -2.1%、4K prose +2.7%、24K code +4.3%、24K prose +5.0%。4 セルの中央値は約 +2.5%。
++- 5% 閾値に到達したのは 24K prose のみ (5.0%)。24K code の +4.3% は A 自身の A1 vs A2b の揺れ (4.3%) と同じ大きさ。
++- 出力は A の揺れと同程度（テキスト比較では区別できない）。bitwise はパリティ 10 本 PASS とコード内の宣言で支持。
++- **判定: 採用推奨とはしない（5% 閾値未満）**。理由: (1) 総合の decode 改善が約 +2.5% で 5% 未満、(2) 最大の改善セル
++  24K code の +4.3% は A 自身のドリフトと同程度、(3) 24K prose の +5.0% は 1 セルのみ。
++- ただし機構としては `ADAPT_NOWAIT` / `ADAPT_LAG` による adapt wait の消失 (1.3〜1.8 -> 0.02 ms/window) が一貫して見え、
++  bitwise で害も無い。既定 on のまま残すか opt-in にするかはメインの判断。既定 on を維持する場合の期待は decode +2〜3%（推定）。
++- 既定 on を維持する場合の注意: 今回の A/B は 4 セル × 3 有効値で、A のドリフトが最大 4.3% あるため、+5% 前後の差は
++  追加の 5 ペア以上で再確認するのが望ましい。
++
++## 8. 再現コマンド
++
++```sh
++ssh llm-02
++cd ~/work/wt/defaults
++
++# 1. ビルド（ビルドロック -> build -> package -> image）
++bash scripts/build-sm61.sh sm61-defaults      # タグ strata:fork-sm61-defaults
++
++# 2. パリティ（GPU ロック、本番停止 -> 実行 -> 本番復元）
++bash scripts/parity-sm61.sh
++
++# 3. 速度 A-B-A（A = strata:fork-9f7d977-base、B = strata:fork-sm61-defaults、spec=4 固定）
++bash scripts/ab-sm61.sh speed
++
++# 4. 出力一致 + STRATA_DECODE_TIMING
++bash scripts/ab-sm61.sh output
++```
++
++`scripts/ab-sm61.sh` は GPU ロックを取り、本番を止め、アームごとにエンジンを起動して `~/bench.py`（`BENCH_SEED=42`、
++4K/24K、max 256）と `scripts/answers4.py`（2K/8K/16K/24K、temp 0、max 128、thinking なし）を回し、本番を復元してロックを解放する。
++
++## 9. 未確認・注意
++
++- `STRATA_ADAPT_*` の P40 での寄与は、P40 の expert cache ヒット率が 99% で tier の swap がほぼ動かないため小さいと推定する。
++  P100 の -10 points は「外すと待ちが入る」構造の差で、同じ経路が P40 にもある。
++- `STRATA_FUSE_DECODE` は native pack では一部の fusion 経路が no-op（codemap の指摘）。速度に効かない可能性があるが、
++  bitwise なので既定に入れても害はない。
++- `STRATA_ATTN_DAILY` の chunk kernel は experimental build の sm_61 で既に既定。追加分は v2 merge のみで寄与は小さいと推定。
++- `STRATA_B6_MMVQ_ROWS` は sm_61 の 1-4 token IL 表とは別経路（IL が先に選ばれる T では B6 は走らない）。
++- `STRATA_GR_UP75` は T>=3 のみ。spec=4 の窓は平均 T 2.14（研究資料の profile）なので、走る窓は限られる。
++- P40 はファン無し。A/B は各アームを同じ温度から始める必要がある（89 C で thermal slowdown、1,531 -> 約 1,300 MHz）。
+diff --git a/include/strata/core/layer.hpp b/include/strata/core/layer.hpp
+index 9e0361ac..d6bcd8b1 100644
+--- a/include/strata/core/layer.hpp
++++ b/include/strata/core/layer.hpp
+@@ -171,6 +171,11 @@ bool moe_layer(const WeightTable& tables, const ModelGeometry& g, int64_t layer,
+ /// rung, so a host that sees it knows `h_x_f`/`h_ids`/`h_weights` are in place.
+ bool moe_route(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k, const MoEBuffers& b,
+                const float* x, void* stream, std::string& err, const Doorbell* db = nullptr);
++/// The verify window's n == 1 routing with the CPU pool's doorbell folded into the top-10 launch: the same
++/// router GEMV and top-10 as `moe_route`, then the publish (x/ids to mapped host memory, ring) in one node.
++bool moe_route_publish(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k,
++                       const MoEBuffers& b, const float* x, const int32_t* d_res, int n_expert,
++                       float* x_out, int32_t* ids_out, uint32_t* seq, void* stream, std::string& err);
+ /// The verify window's n tokens routed at once (see layer.cpp); bitwise per token what `moe_route` gives.
+ bool moe_route_window(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k, const MoEBuffers& b,
+                       const float* x, float* logits, int32_t* ids, float* weights, int n, void* stream, std::string& err);
+diff --git a/include/strata/kernels/native_router.hpp b/include/strata/kernels/native_router.hpp
+index a940e1b3..293d42f0 100644
+--- a/include/strata/kernels/native_router.hpp
++++ b/include/strata/kernels/native_router.hpp
+@@ -16,6 +16,12 @@ bool native_router_enabled();
+ void native_router_top10(const float* logits, int32_t* ids, float* weights, void* stream);
+ /// n_tok rows at once (logits [n,512], ids/weights [n,10]); each row exactly as the single call.
+ void native_router_top10_multi(const float* logits, int32_t* ids, float* weights, int n_tok, void* stream);
++/// One token's top-10 and the CPU pool's doorbell publish in one launch (the verify window's n == 1 path):
++/// the ids/weights are `native_router_top10`'s bits, the mapped rows and the ring are `doorbell_publish_res`'s.
++/// x is [n] f32 (n_embd); d_res is the layer's residency table (nullptr: publish the rows unconditionally).
++void native_router_top10_publish(const float* logits, int32_t* ids, float* weights, const float* x,
++                                 const int32_t* d_res, int n_expert, int n, int k, float* x_out,
++                                 int32_t* ids_out, uint32_t* seq, void* stream);
+ /// The same contract for a model family's (experts, top-k): 512 / 10 (Flash-Next: the two calls above, unchanged) and
+ /// 256 / 8 (Qwen3.6-35B-A3B).  logits [n_tok, n_expert], ids / weights [n_tok, k].  CUDA / HIP.
+ bool native_router_topk_supported(int n_expert, int k);
+diff --git a/scripts/ab-sm61.sh b/scripts/ab-sm61.sh
+new file mode 100755
+index 00000000..56db30d9
+--- /dev/null
++++ b/scripts/ab-sm61.sh
+@@ -0,0 +1,125 @@
++#!/bin/bash
++# sm_61 既定スイッチ集合の A/B。GPU ロック -> 本番停止 -> アームごとにエンジン起動 -> 計測 -> 本番復元 -> ロック解放
++# 使い方: scripts/ab-sm61.sh <speed|output|timing>
++set -u
++mode=${1:-speed}
++res=~/work/results/defaults
++A=${A_IMAGE:-strata:fork-9f7d977-base}
++B=${B_IMAGE:-strata:fork-sm61-defaults}
++vol=/var/lib/docker/volumes/compose_strata-data/_data
++port=${PORT:-18080}
++mkdir -p "$res"
++
++# GPU ロック（取れなければ 3 秒間隔で待つ。30 分で諦める）
++t=0
++until mkdir /tmp/strata-gpu.lock 2>/dev/null; do
++  [ $t -ge 1200 ] && { echo "GPU lock busy" >&2; exit 2; }
++  sleep 3; t=$((t+1))
++done
++echo "defaults-$mode $(date -Is)" > /tmp/strata-gpu.lock/owner
++
++restore_prod() {
++  cp ~/opt-work/prod.env ~/Strata/docker/compose/.env
++  sudo docker exec strata sh -c "strata launch --stop --preset docker >/dev/null 2>&1; strata launch --delete-preset docker" >/dev/null 2>&1
++  cd ~/Strata/docker/compose && sudo docker compose -f docker-compose.nvidia.yml -f docker-compose.override.yml up -d --force-recreate >/dev/null 2>&1
++  s=""
++  for i in $(seq 1 90); do s=$(sudo docker inspect -f "{{.State.Health.Status}}" strata 2>/dev/null); [ "$s" = healthy ] && break; sleep 10; done
++  echo "prod health: $s image: $(sudo docker inspect -f '{{.Config.Image}}' strata)"
++  PID=$(pgrep -f "strata --serve" | head -1)
++  sudo cat /proc/$PID/environ | tr "\0" "\n" | grep -E "^STRATA_" > "$res/prod-environ-$mode.txt"
++  cat "$res/prod-environ-$mode.txt"
++  sudo docker ps --format '{{.Names}} {{.Status}}'
++  if [ "$s" = healthy ] && diff -q ~/Strata/docker/compose/.env ~/opt-work/prod.env >/dev/null; then
++    rm -rf /tmp/strata-gpu.lock && echo "gpu lock released $(date -Is)" && return 0
++  fi
++  echo "gpu lock NOT released (restore failed)"; return 1
++}
++
++K=$(grep ^API_KEY= ~/opt-work/prod.env | cut -d= -f2)
++SSET=${SSET:-"ple-io=ram prefill=auto STRATA_DENSE_F32=1 spec=4 spec-min-p=0.5"}
++
++sudo docker exec strata sh -c "strata launch --stop --preset docker" >/dev/null 2>&1
++sudo docker stop -t 120 strata >/dev/null 2>&1
++for i in $(seq 1 40); do
++  used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits)
++  hp=$(awk '/HugePages_Free/{print $2}' /proc/meminfo)
++  alive=$(pgrep -f "strata --serve" | wc -l)
++  [ "$used" -lt 3000 ] && [ "$hp" -ge 20464 ] && [ "$alive" -eq 0 ] && break
++  sleep 3
++done
++echo "prod stopped: VRAM ${used} MiB, HugePages_Free ${hp}, engines ${alive}"
++
++start_arm() {   # $1 label, $2 image, $3 extra env (may be empty)
++  local label=$1 image=$2 extra=${3:-}
++  local st="$res/state-$label"
++  sudo rm -rf "$st"; sudo cp -a "$vol/state" "$st"
++  sudo docker rm -f strata-fork >/dev/null 2>&1
++  sleep 5
++  sudo docker run -d --name strata-fork --gpus all --cpuset-cpus 36-47 \
++    --ulimit memlock=-1:-1 --shm-size 2g -p 127.0.0.1:$port:8080 \
++    -e MODEL=IQ3_XXS -e FAMILY=qwen -e CONTEXT=128k -e PARALLEL=1 -e VISION=off -e TUNE=skip \
++    -e API_KEY="$K" -e STRATA_SET="$SSET" $extra \
++    -v "$vol":/data -v "$st":/data/state \
++    --restart no "$image" > "$res/docker-run-$label.log" 2>&1
++  [ $? -eq 0 ] || { cat "$res/docker-run-$label.log"; return 3; }
++  local s=""
++  for i in $(seq 1 90); do
++    s=$(sudo docker inspect -f "{{.State.Health.Status}}" strata-fork 2>/dev/null)
++    [ "$s" = healthy ] && break
++    sudo docker inspect -f "{{.State.Status}}" strata-fork 2>/dev/null | grep -q exited && break
++    sleep 5
++  done
++  echo "arm $label health=$s"
++  sudo docker logs strata-fork > "$res/docker-$label.log" 2>&1
++  grep -E "speed switches on by default|engine started" "$st/strata/launch/docker.engine.log" | tail -5 > "$res/startup-$label.txt"
++  cat "$res/startup-$label.txt"
++  [ "$s" = healthy ] || { tail -40 "$res/docker-$label.log"; return 4; }
++}
++
++bench_arm() {   # $1 label, $2 repeat
++  local label=$1 rep=${2:-4}
++  local ts=$(date +%m%d-%H%M%S)
++  STRATA_URL="http://127.0.0.1:$port" BENCH_SEED=42 STRATA_API_KEY=$K python3 ~/bench.py 4000,24000 "$rep" 256 \
++    > "$res/bench-$mode-$label-$ts.jsonl"
++  echo "bench $label:"; cat "$res/bench-$mode-$label-$ts.jsonl"
++  STRATA_URL="http://127.0.0.1:$port" STRATA_API_KEY=$K python3 ~/work/wt/defaults/scripts/answers4.py "$res/answers-$mode-$label-$ts.json" \
++    > "$res/answers-$mode-$label-$ts.out" 2>&1
++  cat "$res/answers-$mode-$label-$ts.out"
++}
++
++stop_arm() {
++  sudo docker rm -f strata-fork >/dev/null 2>&1
++  for i in $(seq 1 20); do
++    used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits)
++    [ "$used" -lt 3000 ] && break
++    sleep 3
++  done
++}
++
++case "$mode" in
++  speed)
++    start_arm A1 "$A" "" || { stop_arm; restore_prod; exit 3; }
++    bench_arm A1 4; stop_arm
++    start_arm B1 "$B" "" || { stop_arm; restore_prod; exit 3; }
++    bench_arm B1 4; stop_arm
++    start_arm A2 "$A" "" || { stop_arm; restore_prod; exit 3; }
++    bench_arm A2 4; stop_arm
++    ;;
++  output|timing)
++    start_arm A1 "$A" "-e STRATA_DECODE_TIMING=1" || { stop_arm; restore_prod; exit 3; }
++    bench_arm A1 1
++    grep -E "decode timing|window|ms" "$res/state-A1/strata/launch/docker.engine.log" | tail -60 > "$res/timing-A1.txt" || true
++    stop_arm
++    start_arm A2 "$A" "" || { stop_arm; restore_prod; exit 3; }
++    bench_arm A2 1; stop_arm
++    start_arm B1 "$B" "-e STRATA_DECODE_TIMING=1" || { stop_arm; restore_prod; exit 3; }
++    bench_arm B1 1
++    grep -E "decode timing|window|ms" "$res/state-B1/strata/launch/docker.engine.log" | tail -60 > "$res/timing-B1.txt" || true
++    stop_arm
++    ;;
++  *)
++    echo "unknown mode $mode" >&2; rm -rf /tmp/strata-gpu.lock; exit 2 ;;
++esac
++
++restore_prod || exit 5
++echo AB_ALL_OK
+diff --git a/scripts/answers4.py b/scripts/answers4.py
+new file mode 100644
+index 00000000..d5168f24
+--- /dev/null
++++ b/scripts/answers4.py
+@@ -0,0 +1,38 @@
++"""固定 4 プロンプト (2K/8K/16K/24K) の greedy 回答を保存する。A/B の出力一致と A 同士の揺れを見るため。
++プロンプトは bench.py と同じ corpus と固定シードで作るので、アーム間で本文が同一になる。
++"""
++import glob, json, os, random, sys, urllib.request
++
++base = os.environ.get("STRATA_URL", "http://127.0.0.1:8080")
++key = os.environ["STRATA_API_KEY"]
++corpus = "\n\n".join(open(p, encoding="utf-8", errors="ignore").read()
++                      for p in sorted(glob.glob(os.path.expanduser("~/Strata/docs/*.md"))))
++seed_rnd = random.Random(42)   # BENCH_SEED=42 と同じ
++sizes = [2000, 8000, 16000, 24000]
++task = ("Based on the documents above, answer in one short paragraph: "
++        "what are the three most important trade-offs this system makes?")
++out = []
++for n in sizes:
++    rnd = random.Random(seed_rnd.random())
++    n_chars = int(n * 3.6)
++    start = rnd.randint(0, max(0, len(corpus) - n_chars - 1))
++    start = corpus.find("\n", start) + 1
++    prompt = corpus[start:start + n_chars] + "\n\n---\n" + task
++    req = urllib.request.Request(
++        base + "/v1/chat/completions",
++        data=json.dumps({
++            "model": "default",
++            "messages": [{"role": "user", "content": prompt}],
++            "max_tokens": 128,
++            "temperature": 0,
++            "chat_template_kwargs": {"enable_thinking": False},
++        }).encode(),
++        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
++    )
++    with urllib.request.urlopen(req, timeout=1800) as res:
++        d = json.load(res)
++    out.append({"size": n, "prompt_tokens": d.get("usage", {}).get("prompt_tokens", 0),
++                "completion_tokens": d.get("usage", {}).get("completion_tokens", 0),
++                "content": d["choices"][0]["message"].get("content", "")})
++    print(f"  size {n}: prompt {out[-1]['prompt_tokens']} tok, answer {out[-1]['completion_tokens']} tok", flush=True)
++json.dump(out, open(sys.argv[1], "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+diff --git a/scripts/build-in-container.sh b/scripts/build-in-container.sh
+new file mode 100755
+index 00000000..9a3fb8bd
+--- /dev/null
++++ b/scripts/build-in-container.sh
+@@ -0,0 +1,35 @@
++#!/bin/sh
++# コンテナ内で configure とビルドを行う。P40 (sm_61) 専用で、ホスト側のコードは -march=native
++# 元は ~/opt-work/src-build/build-in-container.sh（0.1.52 で成功したもの）。フォーク HEAD 用に
++# ターゲットを strata / strata_kq に絞り、ggml はピン留めの llama.cpp から取る
++set -eu
++build_dir=${BUILD_DIR:-build-native}
++mode=${MODE:-native}
++src=${SRC:-/work/strata}
++export PATH=/venv/bin:$PATH
++cd "$src"
++# cmake 4.4.3 / ninja 1.13.2 は requirements-build.txt から venv に入れる（配布版と同じ版）
++if ! command -v ninja >/dev/null 2>&1 || [ ! -x /venv/bin/cmake ]; then
++  apt-get update -qq
++  apt-get install -y -qq --no-install-recommends build-essential ca-certificates git libgomp1 libatomic1 python3 python3-pip python3-venv unzip >/dev/null
++  python3 -m venv /venv
++  /venv/bin/pip install -q -r requirements-build.txt
++fi
++# フォーク HEAD は third_party/llama.cpp を同梱しない（.gitignore 対象）。setup.get_llama_cpp() が
++# ピン留めコミット 3cf03257 を取ってくる。ホスト側で用意済みならそれをそのまま使う
++[ -f third_party/llama.cpp/ggml/CMakeLists.txt ] || python3 -c "import setup; print(setup.get_llama_cpp())"
++if [ "$mode" = native ]; then
++  # 配布版は STRATA_PORTABLE=ON。ここでは全ホストコードを Broadwell 向けにする
++  host="-DSTRATA_PORTABLE=OFF -DCMAKE_C_FLAGS=-march=native -DCMAKE_CXX_FLAGS=-march=native -DCMAKE_CUDA_FLAGS=-Xcompiler=-march=native"
++else
++  host="-DSTRATA_PORTABLE=ON"
++fi
++# shellcheck disable=SC2086
++/venv/bin/cmake -G Ninja -S . -B "$build_dir" -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=ON \
++  -DSTRATA_EXPERIMENTAL_SM60=ON -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_Q6K_EXPERTS=ON -DSTRATA_MMQ_KQUANTS=ON \
++  -DCMAKE_CUDA_ARCHITECTURES=61-real -DSTRATA_GGML_DIR="$src/third_party/llama.cpp" $host
++# テストは必要になったときだけ EXTRA_TARGETS で足す（既定はエンジンと K-quant MMQ ライブラリのみ）
++# shellcheck disable=SC2086
++/venv/bin/cmake --build "$build_dir" -j 12 --target strata strata_kq ${EXTRA_TARGETS:-}
++grep -E "CMAKE_(C|CXX|CUDA)_FLAGS:|GGML_NATIVE|STRATA_PORTABLE|CMAKE_CUDA_ARCHITECTURES" "$build_dir/CMakeCache.txt"
++echo BUILD_OK
+diff --git a/scripts/build-sm61.sh b/scripts/build-sm61.sh
+new file mode 100755
+index 00000000..02fb6c6b
+--- /dev/null
++++ b/scripts/build-sm61.sh
+@@ -0,0 +1,48 @@
++#!/bin/bash
++# ホスト側の一括ビルド (sm_61 既定スイッチ集合): ビルドロック -> コンテナで configure/build -> パッケージ -> docker/build.sh
++# CPU 36-47、-j 12。ロックはこのスクリプトが取り、終了時に必ず解放する
++set -u
++wt=~/work/wt/defaults
++res=~/work/results/defaults
++label=${1:-sm61-defaults}
++commit=$(git -C "$wt" rev-parse --short=7 HEAD)
++tag=${TAG:-strata:fork-sm61-defaults}
++img=nvidia/cuda:12.9.1-devel-ubuntu24.04
++mkdir -p "$res" "$wt/engines"
++if ! mkdir /tmp/strata-build.lock 2>/dev/null; then
++  echo "build lock held by $(cat /tmp/strata-build.lock/owner 2>/dev/null)" >&2; exit 2
++fi
++echo "build $label $(date -Is)" > /tmp/strata-build.lock/owner
++trap 'rm -rf /tmp/strata-build.lock; echo "build lock released $(date -Is)"' EXIT
++
++t0=$(date +%s)
++# SKIP_BUILD=1 でビルドを飛ばし、パッケージとイメージ作成だけやり直す
++if [ "${SKIP_BUILD:-0}" = 1 ]; then
++  echo "build skipped (SKIP_BUILD=1)"
++else
++# sm_61 に関係するパリティテストも一緒にビルドする（実行は GPU ロックを取ってから）
++TESTS=${EXTRA_TARGETS:-"nv_defaults_test qsa_merge_daily_parity qsa_rows_bench mmvq_multi_parity b6_mmvq_bench native_grouped_parity s2_expert_grouped_parity mmvq_il_parity dequant_wide_parity iq_parity"}
++sudo docker run --rm --cpuset-cpus 36-47 -v "$wt":/work/strata -v "$wt/engines":/work/engines -w /work/strata \
++  -e BUILD_DIR=build-native -e MODE=native -e EXTRA_TARGETS="$TESTS" "$img" sh /work/strata/scripts/build-in-container.sh \
++  > "$res/build-$label.log" 2>&1
++rc=$?; t1=$(date +%s)
++echo "build exit $rc in $((t1-t0))s (log: $res/build-$label.log)"
++[ $rc -eq 0 ] || { tail -n 60 "$res/build-$label.log"; exit $rc; }
++fi
++t1=$(date +%s)
++
++sudo docker run --rm --cpuset-cpus 36-47 -v "$wt":/work/strata -v "$wt/engines":/work/engines -w /work/strata \
++  -e BUILD_DIR=build-native -e LABEL="$label" -e OUT=/work/engines/$label "$img" sh /work/strata/scripts/package-in-container.sh \
++  > "$res/package-$label.log" 2>&1
++rc=$?; t2=$(date +%s)
++echo "package exit $rc in $((t2-t1))s (log: $res/package-$label.log)"
++[ $rc -eq 0 ] || { tail -n 60 "$res/package-$label.log"; exit $rc; }
++
++eng=$(ls -d "$wt"/engines/$label/*/ | head -1); eng=${eng%/}
++sudo env STRATA_BUILD_COMMIT=$(git -C "$wt" rev-parse HEAD) "$wt/docker/build.sh" --flavor cuda --engine "$eng" --tag "$tag" \
++  > "$res/image-$label.log" 2>&1
++rc=$?; t3=$(date +%s)
++echo "image exit $rc in $((t3-t2))s (log: $res/image-$label.log) tag=$tag total=$((t3-t0))s"
++[ $rc -eq 0 ] || { tail -n 60 "$res/image-$label.log"; exit $rc; }
++sudo docker image inspect "$tag" --format 'image {{.RepoTags}} {{.Size}}'
++echo BUILD_ALL_OK
+diff --git a/scripts/identity-sm61.sh b/scripts/identity-sm61.sh
+new file mode 100755
+index 00000000..1aab4bb0
+--- /dev/null
++++ b/scripts/identity-sm61.sh
+@@ -0,0 +1,96 @@
++#!/bin/bash
++# 出力の identity gate: CPU の揺れを消す設定（STRATA_IQ_MT_MIN=1, PREFILL_CPU_SHARE=0, ROUTE_TAIL_SKIP=0）で
++# A を 2 回、B を 1 回走らせ、回答が byte 一致するかを見る。GPU ロック -> 本番停止 -> 復元
++set -u
++res=~/work/results/defaults
++A=${A_IMAGE:-strata:fork-9f7d977-base}
++B=${B_IMAGE:-strata:fork-sm61-defaults}
++vol=/var/lib/docker/volumes/compose_strata-data/_data
++port=${PORT:-18080}
++mkdir -p "$res"
++
++t=0
++until mkdir /tmp/strata-gpu.lock 2>/dev/null; do
++  [ $t -ge 1200 ] && { echo "GPU lock busy" >&2; exit 2; }
++  sleep 3; t=$((t+1))
++done
++echo "defaults-identity $(date -Is)" > /tmp/strata-gpu.lock/owner
++
++restore_prod() {
++  cp ~/opt-work/prod.env ~/Strata/docker/compose/.env
++  sudo docker exec strata sh -c "strata launch --stop --preset docker >/dev/null 2>&1; strata launch --delete-preset docker" >/dev/null 2>&1
++  cd ~/Strata/docker/compose && sudo docker compose -f docker-compose.nvidia.yml -f docker-compose.override.yml up -d --force-recreate >/dev/null 2>&1
++  s=""
++  for i in $(seq 1 90); do s=$(sudo docker inspect -f "{{.State.Health.Status}}" strata 2>/dev/null); [ "$s" = healthy ] && break; sleep 10; done
++  echo "prod health: $s"
++  sudo docker ps --format '{{.Names}} {{.Status}}'
++  if [ "$s" = healthy ] && diff -q ~/Strata/docker/compose/.env ~/opt-work/prod.env >/dev/null; then
++    rm -rf /tmp/strata-gpu.lock && echo "gpu lock released $(date -Is)" && return 0
++  fi
++  echo "gpu lock NOT released (restore failed)"; return 1
++}
++
++K=$(grep ^API_KEY= ~/opt-work/prod.env | cut -d= -f2)
++SSET="ple-io=ram prefill=auto STRATA_DENSE_F32=1 spec=4 spec-min-p=0.5 STRATA_IQ_MT_MIN=1 STRATA_PREFILL_CPU_SHARE=0 STRATA_ROUTE_TAIL_SKIP=0"
++
++sudo docker exec strata sh -c "strata launch --stop --preset docker" >/dev/null 2>&1
++sudo docker stop -t 120 strata >/dev/null 2>&1
++for i in $(seq 1 40); do
++  used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits)
++  hp=$(awk '/HugePages_Free/{print $2}' /proc/meminfo)
++  alive=$(pgrep -f "strata --serve" | wc -l)
++  [ "$used" -lt 3000 ] && [ "$hp" -ge 20464 ] && [ "$alive" -eq 0 ] && break
++  sleep 3
++done
++echo "prod stopped: VRAM ${used} MiB, HugePages_Free ${hp}, engines ${alive}"
++
++start_arm() {   # $1 label, $2 image
++  local label=$1 image=$2
++  local st="$res/state-$label"
++  sudo rm -rf "$st"; sudo cp -a "$vol/state" "$st"
++  sudo docker rm -f strata-fork >/dev/null 2>&1
++  sleep 5
++  sudo docker run -d --name strata-fork --gpus all --cpuset-cpus 36-47 \
++    --ulimit memlock=-1:-1 --shm-size 2g -p 127.0.0.1:$port:8080 \
++    -e MODEL=IQ3_XXS -e FAMILY=qwen -e CONTEXT=128k -e PARALLEL=1 -e VISION=off -e TUNE=skip \
++    -e API_KEY="$K" -e STRATA_SET="$SSET" \
++    -v "$vol":/data -v "$st":/data/state \
++    --restart no "$image" > "$res/docker-run-$label.log" 2>&1
++  [ $? -eq 0 ] || { cat "$res/docker-run-$label.log"; return 3; }
++  local s=""
++  for i in $(seq 1 90); do
++    s=$(sudo docker inspect -f "{{.State.Health.Status}}" strata-fork 2>/dev/null)
++    [ "$s" = healthy ] && break
++    sudo docker inspect -f "{{.State.Status}}" strata-fork 2>/dev/null | grep -q exited && break
++    sleep 5
++  done
++  echo "arm $label health=$s"
++  sudo docker logs strata-fork > "$res/docker-$label.log" 2>&1
++  grep -E "speed switches on by default" "$st/strata/launch/docker.engine.log" | tail -2 > "$res/startup-$label.txt"
++  cat "$res/startup-$label.txt"
++  [ "$s" = healthy ] || { tail -40 "$res/docker-$label.log"; return 4; }
++}
++
++answers_arm() {   # $1 label
++  local label=$1
++  local ts=$(date +%m%d-%H%M%S)
++  STRATA_URL="http://127.0.0.1:$port" STRATA_API_KEY=$K python3 ~/work/wt/defaults/scripts/answers4.py "$res/answers-identity-$label-$ts.json" \
++    > "$res/answers-identity-$label-$ts.out" 2>&1
++  cat "$res/answers-identity-$label-$ts.out"
++}
++
++stop_arm() {
++  sudo docker rm -f strata-fork >/dev/null 2>&1
++  for i in $(seq 1 20); do
++    used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits)
++    [ "$used" -lt 3000 ] && break
++    sleep 3
++  done
++}
++
++start_arm A1 "$A" || { stop_arm; restore_prod; exit 3; }; answers_arm A1; stop_arm
++start_arm A2 "$A" || { stop_arm; restore_prod; exit 3; }; answers_arm A2; stop_arm
++start_arm B1 "$B" || { stop_arm; restore_prod; exit 3; }; answers_arm B1; stop_arm
++
++restore_prod || exit 5
++echo IDENTITY_ALL_OK
+diff --git a/scripts/package-in-container.sh b/scripts/package-in-container.sh
+new file mode 100755
+index 00000000..a81d4aaf
+--- /dev/null
++++ b/scripts/package-in-container.sh
+@@ -0,0 +1,29 @@
++#!/bin/sh
++# Dockerfile の engine-build 段の後半と同じ手順でエンジン部品パッケージを作る（vision なし）
++# 元は ~/opt-work/src-build/package-in-container.sh。出力先だけ OUT で差し替えられるようにした
++set -eu
++build_dir=${BUILD_DIR:-build-native}
++label=${LABEL:-native}
++src=${SRC:-/work/strata}
++stage=${STAGE:-/work/stage-$label}
++out=${OUT:-/work/engine-$label}
++export PATH=/venv/bin:$PATH
++cd "$src"
++# ビルドとは別のコンテナで動かすため、python3 はここで入れる（ビルド側の venv は引き継がれない）
++if ! command -v python3 >/dev/null 2>&1; then
++  apt-get update -qq
++  apt-get install -y -qq --no-install-recommends python3 >/dev/null
++fi
++rm -rf "$stage" "$out"; mkdir -p "$stage" "$out"
++cp "$build_dir/strata" "$stage/"
++cp "$build_dir/libstrata_kq.so" "$stage/"
++ver=$(sed -n 's/^[[:space:]]*project([^)]*VERSION[[:space:]]*\([0-9][0-9.]*\).*/\1/p' CMakeLists.txt | head -1)
++cudafull=$(nvcc --version | sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -1)
++echo "{\"version\": \"$ver\", \"source\": \"fork $label\", \"archs\": \"61\", \"cuda\": \"$cudafull\", \"portable\": false}" > "$stage/BUILD.json"
++python3 packaging/collect_libs.py --binary "$build_dir/strata" --search /usr/local/cuda/lib64 --out "$stage" --also 'libcublasLt.so*'
++python3 packaging/package_engine.py --src "$stage" --backend cuda --version "$ver" --out "$out" --arch sm_61 \
++  --min-driver nvidia=575.51 --variant cuda12 --platform linux-x86_64 --build-id "fork-$label-$ver-cuda$cudafull" \
++  --include SYSTEM-LIBS.txt --include 'libstrata_kq*'
++for d in "$out"/*/; do python3 packaging/package_engine.py --verify "$d"; python3 packaging/binary_deps.py "$d"; done
++ls "$out"
++echo PACKAGE_OK
+diff --git a/scripts/parity-sm61.sh b/scripts/parity-sm61.sh
+new file mode 100755
+index 00000000..251129d0
+--- /dev/null
++++ b/scripts/parity-sm61.sh
+@@ -0,0 +1,78 @@
++#!/bin/bash
++# sm_61 に関係するパリティテストを GPU ロック下で実行する。本番を止めて VRAM を空け、終了時に復元する
++set -u
++res=~/work/results/defaults
++wt=~/work/wt/defaults
++bd=/work/strata/build-native
++img=nvidia/cuda:12.9.1-devel-ubuntu24.04
++mkdir -p "$res"
++
++t=0
++until mkdir /tmp/strata-gpu.lock 2>/dev/null; do
++  [ $t -ge 600 ] && { echo "GPU lock busy" >&2; exit 2; }
++  sleep 3; t=$((t+1))
++done
++echo "defaults-parity $(date -Is)" > /tmp/strata-gpu.lock/owner
++
++restore_prod() {
++  cp ~/opt-work/prod.env ~/Strata/docker/compose/.env
++  sudo docker exec strata sh -c "strata launch --stop --preset docker >/dev/null 2>&1; strata launch --delete-preset docker" >/dev/null 2>&1
++  cd ~/Strata/docker/compose && sudo docker compose -f docker-compose.nvidia.yml -f docker-compose.override.yml up -d --force-recreate >/dev/null 2>&1
++  s=""
++  for i in $(seq 1 90); do s=$(sudo docker inspect -f "{{.State.Health.Status}}" strata 2>/dev/null); [ "$s" = healthy ] && break; sleep 10; done
++  echo "prod health: $s"
++  sudo docker ps --format '{{.Names}} {{.Status}}'
++  if [ "$s" = healthy ] && diff -q ~/Strata/docker/compose/.env ~/opt-work/prod.env >/dev/null; then
++    rm -rf /tmp/strata-gpu.lock && echo "gpu lock released $(date -Is)" && return 0
++  fi
++  echo "gpu lock NOT released (restore failed)"; return 1
++}
++
++sudo docker exec strata sh -c "strata launch --stop --preset docker" >/dev/null 2>&1
++sudo docker stop -t 120 strata >/dev/null 2>&1
++for i in $(seq 1 40); do
++  used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits)
++  hp=$(awk '/HugePages_Free/{print $2}' /proc/meminfo)
++  alive=$(pgrep -f "strata --serve" | wc -l)
++  [ "$used" -lt 3000 ] && [ "$hp" -ge 20464 ] && [ "$alive" -eq 0 ] && break
++  sleep 3
++done
++echo "prod stopped: VRAM ${used} MiB, HugePages_Free ${hp}, engines ${alive}"
++
++run_gpu() {   # $1 name, rest: command line inside the build dir
++  local name=$1; shift
++  sudo docker run --rm --gpus all --cpuset-cpus 36-47 -v "$wt":/work/strata -w "$bd" \
++    "$img" sh -c "export LD_LIBRARY_PATH=$bd:/usr/local/cuda/lib64; cd $bd && $*" \
++    > "$res/parity-$name.log" 2>&1
++  local rc=$?
++  echo "parity $name exit $rc"
++  tail -6 "$res/parity-$name.log"
++  return $rc
++}
++
++run_cpu() {   # $1 name, rest: command line inside the build dir
++  local name=$1; shift
++  sudo docker run --rm --cpuset-cpus 36-47 -v "$wt":/work/strata -w "$bd" \
++    "$img" sh -c "export LD_LIBRARY_PATH=$bd:/usr/local/cuda/lib64; cd $bd && $*" \
++    > "$res/parity-$name.log" 2>&1
++  local rc=$?
++  echo "parity $name exit $rc"
++  tail -6 "$res/parity-$name.log"
++  return $rc
++}
++
++rc=0
++run_cpu nv_defaults_test ./nv_defaults_test || rc=1
++run_gpu qsa_merge_daily_default ./qsa_merge_daily_parity --device 0 || rc=1
++run_gpu qsa_merge_daily_daily 'STRATA_ATTN_DAILY=1 ./qsa_merge_daily_parity --device 0' || rc=1
++run_gpu qsa_rows_rows './qsa_rows_bench --device 0 --iters 20 --rows' || rc=1
++run_gpu mmvq_multi ./mmvq_multi_parity || rc=1
++run_gpu b6_mmvq './b6_mmvq_bench 50 0 1' || rc=1
++run_gpu native_grouped ./native_grouped_parity || rc=1
++run_gpu s2_expert_grouped './s2_expert_grouped_parity --selftest' || rc=1
++run_gpu mmvq_il './mmvq_il_parity' || rc=1
++run_gpu dequant_wide ./dequant_wide_parity || rc=1
++
++echo "PARITY_RC=$rc"
++restore_prod || exit 5
++[ $rc -eq 0 ] && echo PARITY_ALL_OK || echo PARITY_SOME_FAILED
+diff --git a/scripts/speed-a2.sh b/scripts/speed-a2.sh
+new file mode 100755
+index 00000000..15cfe01d
+--- /dev/null
++++ b/scripts/speed-a2.sh
+@@ -0,0 +1,75 @@
++#!/bin/bash
++# 汚染された A2 の再測: base イメージ (A) だけを 4 reps で走らせる。A-B-A の 3 本目に使う
++set -u
++res=~/work/results/defaults
++A=${A_IMAGE:-strata:fork-9f7d977-base}
++vol=/var/lib/docker/volumes/compose_strata-data/_data
++port=${PORT:-18080}
++mkdir -p "$res"
++
++t=0
++until mkdir /tmp/strata-gpu.lock 2>/dev/null; do
++  [ $t -ge 1200 ] && { echo "GPU lock busy" >&2; exit 2; }
++  sleep 3; t=$((t+1))
++done
++echo "defaults-a2only $(date -Is)" > /tmp/strata-gpu.lock/owner
++
++restore_prod() {
++  cp ~/opt-work/prod.env ~/Strata/docker/compose/.env
++  sudo docker exec strata sh -c "strata launch --stop --preset docker >/dev/null 2>&1; strata launch --delete-preset docker" >/dev/null 2>&1
++  cd ~/Strata/docker/compose && sudo docker compose -f docker-compose.nvidia.yml -f docker-compose.override.yml up -d --force-recreate >/dev/null 2>&1
++  s=""
++  for i in $(seq 1 90); do s=$(sudo docker inspect -f "{{.State.Health.Status}}" strata 2>/dev/null); [ "$s" = healthy ] && break; sleep 10; done
++  echo "prod health: $s"
++  sudo docker ps --format '{{.Names}} {{.Status}}'
++  if [ "$s" = healthy ] && diff -q ~/Strata/docker/compose/.env ~/opt-work/prod.env >/dev/null; then
++    rm -rf /tmp/strata-gpu.lock && echo "gpu lock released $(date -Is)" && return 0
++  fi
++  echo "gpu lock NOT released (restore failed)"; return 1
++}
++
++K=$(grep ^API_KEY= ~/opt-work/prod.env | cut -d= -f2)
++SSET=${SSET:-"ple-io=ram prefill=auto STRATA_DENSE_F32=1 spec=4 spec-min-p=0.5"}
++
++sudo docker exec strata sh -c "strata launch --stop --preset docker" >/dev/null 2>&1
++sudo docker stop -t 120 strata >/dev/null 2>&1
++for i in $(seq 1 40); do
++  used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits)
++  hp=$(awk '/HugePages_Free/{print $2}' /proc/meminfo)
++  alive=$(pgrep -f "strata --serve" | wc -l)
++  [ "$used" -lt 3000 ] && [ "$hp" -ge 20464 ] && [ "$alive" -eq 0 ] && break
++  sleep 3
++done
++echo "prod stopped: VRAM ${used} MiB, HugePages_Free ${hp}, engines ${alive}"
++
++label=A2b
++st="$res/state-$label"
++sudo rm -rf "$st"; sudo cp -a "$vol/state" "$st"
++sudo docker rm -f strata-fork >/dev/null 2>&1
++sleep 5
++sudo docker run -d --name strata-fork --gpus all --cpuset-cpus 36-47 \
++  --ulimit memlock=-1:-1 --shm-size 2g -p 127.0.0.1:$port:8080 \
++  -e MODEL=IQ3_XXS -e FAMILY=qwen -e CONTEXT=128k -e PARALLEL=1 -e VISION=off -e TUNE=skip \
++  -e API_KEY="$K" -e STRATA_SET="$SSET" \
++  -v "$vol":/data -v "$st":/data/state \
++  --restart no "$A" > "$res/docker-run-$label.log" 2>&1
++s=""
++for i in $(seq 1 90); do
++  s=$(sudo docker inspect -f "{{.State.Health.Status}}" strata-fork 2>/dev/null)
++  [ "$s" = healthy ] && break
++  sudo docker inspect -f "{{.State.Status}}" strata-fork 2>/dev/null | grep -q exited && break
++  sleep 5
++done
++echo "arm $label health=$s"
++sudo docker logs strata-fork > "$res/docker-$label.log" 2>&1
++ts=$(date +%m%d-%H%M%S)
++STRATA_URL="http://127.0.0.1:$port" BENCH_SEED=42 STRATA_API_KEY=$K python3 ~/bench.py 4000,24000 4 256 \
++  > "$res/bench-a2only-$label-$ts.jsonl"
++cat "$res/bench-a2only-$label-$ts.jsonl"
++STRATA_URL="http://127.0.0.1:$port" STRATA_API_KEY=$K python3 ~/work/wt/defaults/scripts/answers4.py "$res/answers-a2only-$label-$ts.json" \
++  > "$res/answers-a2only-$label-$ts.out" 2>&1 || true
++
++sudo docker rm -f strata-fork >/dev/null 2>&1
++sleep 5
++restore_prod || exit 5
++echo A2ONLY_ALL_OK
+diff --git a/src/core/layer.cpp b/src/core/layer.cpp
+index c6e2831a..47a6de1b 100644
+--- a/src/core/layer.cpp
++++ b/src/core/layer.cpp
+@@ -437,6 +437,26 @@ if (db != nullptr && g_publish_kernel) {
+ // write idempotent across replays of the same graph - a captured literal would ring the same number
+ // forever and the host would never see a change.
+ strata::kernels::doorbell_ring(db->d_seq, stream);    }    return true;}
++// The verify window's n == 1 routing: the same GEMV and top-10 as `moe_route`, with the publish folded into the
++// top-10 launch.  Only the ring/rows move; the ids and weights are the top-10's bits (route_publish).
++bool moe_route_publish(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k,
++                       const MoEBuffers& b, const float* x, const int32_t* d_res, int n_expert,
++                       float* x_out, int32_t* ids_out, uint32_t* seq, void* stream, std::string& err) {
++    using namespace strata::kernels;
++    const LayerView v(tables, layer);
++    const WeightRef* w_router = v.get("ffn_gate_inp.weight");
++    if (w_router == nullptr) { err = v.name("ffn_gate_inp.weight") + " is missing"; return false; }
++    if (!native_bf16_projections) f32_to_bf16_bulk(x, b.x_bf16, g.n_embd, stream);
++    project_bf16(x, b.x_bf16, (const uint16_t*) w_router->data, b.logits, g.n_embd, g.n_expert, true, stream);
++    try {
++        native_router_top10_publish(b.logits, b.ids, b.weights, x, d_res, n_expert, (int) g.n_embd, (int) k,
++                                    x_out, ids_out, seq, stream);
++    } catch (const std::exception& error) {
++        err = v.name("router") + ": " + error.what();
++        return false;
++    }
++    return true;
++}
+ // The verify window's routing: n tokens' logits in one BF16 projection and their top-k in one launch, each token
+ // bitwise what `moe_route` gives it (the projection is the same kernel per column, the top-k kernel is per token).
+ // Anything else (a native router, the canonical BF16 GEMVs, a doorbell) takes the per-token `moe_route`.
+diff --git a/src/core/nv_defaults.cpp b/src/core/nv_defaults.cpp
+index 82cc386e..9d308d77 100644
+--- a/src/core/nv_defaults.cpp
++++ b/src/core/nv_defaults.cpp
+@@ -50,6 +50,24 @@ std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int m
+             {"STRATA_FUSE_DECODE", "1"},         // -1.3
+             {"STRATA_GR_UP75", "1"},             // -1.2
+         };
++    } else if (mj == 6 && mn == 1) {
++        // Tesla P40 (sm_61): the seven sm_60 scheduling switches plus the sm_86 ones that have a Pascal path.  Every one
++        // is bit-exact on the cards it was measured on (docs/DETAILS.md's per-architecture table); the P40 has dp4a, no
++        // BF16, 48 KB of shared memory per block and no tensor core, and its expert mode 8 already fuses gate/up + SwiGLU
++        // + q8_1, so the sm_86 table's GU_SWIGLU (CUDA layout only) is left out here.
++        if (off("STRATA_SM61_PERF")) return t;
++        t = {
++            {"STRATA_ADAPT_NOWAIT", "1"},        // the window starts before the adaptive tier's copies land (P100 -10 points when removed)
++            {"STRATA_ADAPT_LAG", "2"},           // the window takes the tier's swaps two windows old (P100 +3.5%)
++            {"STRATA_CPU_IQ_ALL_EXACT1", "1"},   // one-token AVX2 rows with ggml's float order; the P40 host has AVX2 and no AVX-512
++            {"STRATA_SIDE_MIXER", "2"},          // the mixer's input-only work on graph branches; no arithmetic changes (P100 -1.8)
++            {"STRATA_FUSE_WAIT", "2"},           // the plan's wait folded into the copy after it (P100 -1.6)
++            {"STRATA_B6_MMVQ_ROWS", "1"},        // the exact multi-column matvec with the activation fragment reused (P100 -1.3)
++            {"STRATA_FUSE_DECODE", "1"},         // PR #1097's operator fusions; compiled only into the CUDA 12 Pascal engine (P100 -1.3)
++            {"STRATA_GR_UP75", "1"},             // the hyper-connection up read for 3+ tokens; bitwise gr_up_multi_kernel
++            {"STRATA_ATTN_DAILY", "1"},          // PR #540's chunk kernel is already the sm_61 default here; this adds the bitwise v2 merge
++            {"STRATA_QSA_ROWS", "1"},            // the block scorer up to 4 queries in registers; the same bits
++        };
+     } else if (mj == 12 && mn == 1) {
+         // GB10 (NVIDIA DGX Spark, 48 SMs, unified memory): only what was measured on that part goes in.  New in 0.2.7.1, so
+         // STRATA_DEFAULTS=026 (the master switch of everything since 0.2.6) leaves the table out, like STRATA_SM121_PERF=0.
+@@ -97,12 +115,13 @@ std::vector<std::string> apply_nv_defaults(int major, int minor) {
+     }
+     if (!set.empty()) {
+         const bool sm86 = mj == 8;
++        const bool sm61 = mj == 6 && mn == 1;
+         const bool sm121 = mj == 12 && mn == 1;
+-        // sm_86 / sm_60: bit-exact switches.  sm_121: the fused prompt path and the FP4-activation NVFP4 prompt round differently from the
++        // sm_86 / sm_60 / sm_61: bit-exact switches.  sm_121: the fused prompt path and the FP4-activation NVFP4 prompt round differently from the
+         // paths they replace (24 of 24 greedy answers were identical on the Spark; no KL run), so the line does not say "exact".
+         std::fprintf(stderr, "strata: %s: %zu %sspeed switches on by default (%s=0 turns them off%s; a switch you set is kept): ",
+-                     sm86 ? "sm_86 (Ampere)" : sm121 ? "sm_121 (GB10)" : "sm_60 (Pascal)", set.size(), sm121 ? "" : "exact ",
+-                     sm86 ? "STRATA_SM86_PERF" : sm121 ? "STRATA_SM121_PERF" : "STRATA_SM60_PERF",
++                     sm86 ? "sm_86 (Ampere)" : sm61 ? "sm_61 (Pascal, P40)" : sm121 ? "sm_121 (GB10)" : "sm_60 (Pascal)", set.size(), sm121 ? "" : "exact ",
++                     sm86 ? "STRATA_SM86_PERF" : sm61 ? "STRATA_SM61_PERF" : sm121 ? "STRATA_SM121_PERF" : "STRATA_SM60_PERF",
+                      sm121 ? ", as does STRATA_DEFAULTS=026" : "");
+         for (size_t i = 0; i < set.size(); ++i) std::fprintf(stderr, "%s%s", i ? " " : "", set[i].c_str() + 7);
+         std::fprintf(stderr, "\n");
+diff --git a/src/core/nv_defaults_test.cpp b/src/core/nv_defaults_test.cpp
+index 99340da1..fcb6d039 100644
+--- a/src/core/nv_defaults_test.cpp
++++ b/src/core/nv_defaults_test.cpp
+@@ -36,6 +36,7 @@ int main() {
+     unset("STRATA_SM121_PERF");
+     unset("STRATA_SM86_PERF");
+     unset("STRATA_SM60_PERF");
++    unset("STRATA_SM61_PERF");
+     unset("STRATA_EMULATE_CC");
+     // GB10 (12.1): the five measured switches, and nothing else
+     {
+@@ -67,6 +68,28 @@ int main() {
+         CHECK(!p.empty() && p == q);
+         CHECK(!find(a, "STRATA_PF_FUSED") && !find(p, "STRATA_PF_FUSED"));
+     }
++    // Tesla P40 (sm_61): the sm_60 set plus CPU_IQ_ALL_EXACT1 / ATTN_DAILY / QSA_ROWS; all bit-exact, GU_SWIGLU left out
++    {
++        const auto p = nv_default_env(6, 1, false), q = nv_default_env(6, 1, true);
++        CHECK(p.size() == 10);
++        CHECK(p == q);   // STRATA_DEFAULTS=026 does not touch the 2026-11 sm_61 table
++        CHECK(find(p, "STRATA_ADAPT_NOWAIT") && *find(p, "STRATA_ADAPT_NOWAIT") == "1");
++        CHECK(find(p, "STRATA_ADAPT_LAG") && *find(p, "STRATA_ADAPT_LAG") == "2");
++        CHECK(find(p, "STRATA_CPU_IQ_ALL_EXACT1") && *find(p, "STRATA_CPU_IQ_ALL_EXACT1") == "1");
++        CHECK(find(p, "STRATA_SIDE_MIXER") && *find(p, "STRATA_SIDE_MIXER") == "2");
++        CHECK(find(p, "STRATA_FUSE_WAIT") && *find(p, "STRATA_FUSE_WAIT") == "2");
++        CHECK(find(p, "STRATA_B6_MMVQ_ROWS") && *find(p, "STRATA_B6_MMVQ_ROWS") == "1");
++        CHECK(find(p, "STRATA_FUSE_DECODE") && *find(p, "STRATA_FUSE_DECODE") == "1");
++        CHECK(find(p, "STRATA_GR_UP75") && *find(p, "STRATA_GR_UP75") == "1");
++        CHECK(find(p, "STRATA_ATTN_DAILY") && *find(p, "STRATA_ATTN_DAILY") == "1");
++        CHECK(find(p, "STRATA_QSA_ROWS") && *find(p, "STRATA_QSA_ROWS") == "1");
++        CHECK(!find(p, "STRATA_GU_SWIGLU"));   // expert mode 8 already fuses gate/up + SwiGLU + q8_1 on this card
++    }
++    // STRATA_SM61_PERF=0 empties it; a card that is neither 6.0 nor 6.1 gets nothing
++    put("STRATA_SM61_PERF", "0");
++    CHECK(nv_default_env(6, 1, false).empty());
++    unset("STRATA_SM61_PERF");
++    CHECK(nv_default_env(6, 2, false).empty());
+     // round 0212: STRATA_MMQ_KQ=1 is a default for compute capability 8.0+ (owner yes 11-03), with its own off switches
+     unset("STRATA_NV_KQ_DEFAULT");
+     CHECK(kNvKqDefaultOn);
+diff --git a/src/core/verify.cpp b/src/core/verify.cpp
+index 47977c15..6f8b77d1 100644
+--- a/src/core/verify.cpp
++++ b/src/core/verify.cpp
+@@ -451,7 +451,20 @@ bool fuse_wait_on() {
+     // block of the copy poll the flag over PCIe and was -1.5 % there, so it stays opt-in.
+     static const int env = [] { const char* v = std::getenv("STRATA_FUSE_WAIT"); return v != nullptr ? std::atoi(v) : -1; }();
+     if (env >= 0) return env == 1 || env == 2;
+-    return device_is_sm75();
++    if (device_is_sm75()) return true;
++    // P40 (sm_61): the plan's wait and its copy in one node (the same reads).  The rows' version stays opt-in:
++    // every row block polls the flag over PCIe.
++    static int per_dev[64];   // 0 unknown, 1 no, 2 yes
++    int dev = 0;
++    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
++    if (!per_dev[dev]) {
++        int maj = 0, mnr = 0;
++        const bool ok = cudaDeviceGetAttribute(&maj, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
++                        cudaDeviceGetAttribute(&mnr, cudaDevAttrComputeCapabilityMinor, dev) == cudaSuccess;
++        if (!ok) cudaGetLastError();
++        per_dev[dev] = ok && maj == 6 && mnr == 1 ? 2 : 1;
++    }
++    return per_dev[dev] == 2;
+ #endif
+ }
+ // 143-amdk's rows version of the folded wait (copy_rows_from_mapped_after): HIP with fuse_wait_on, CUDA STRATA_FUSE_WAIT=1
+@@ -1424,8 +1437,15 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+         in_s = df_side_[1];
+         inputs_pending = true;
+     }
+-    copy_i32_from_mapped(step_, m_step_, (int64_t) T * kStepCount, in_s);
+-    copy_i32_from_mapped(pos_, m_pos_, (int64_t) MT * (NH + NKV + IQ), in_s);
++    {
++        // the window's three staging reads in one launch (copy_from_mapped_multi): the same words, two nodes fewer
++        strata::kernels::MappedCopy in_copies[3] = {
++            {tok_, m_tok_, T},
++            {step_, m_step_, (int64_t) T * kStepCount},
++            {pos_, m_pos_, (int64_t) MT * (NH + NKV + IQ)},
++        };
++        strata::kernels::copy_from_mapped_multi(in_copies, 3, in_s);
++    }
+     // per-ROW positions of the K rows [t][NKV] and the indexer query rows [t][IQ] (for batched RoPE)
+     const int32_t* pos_k = pos_ + MT * NH;
+     const int32_t* pos_i = pos_ + MT * (NH + NKV);
+@@ -2196,6 +2216,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+         // move into the combine, gate + up share one launch (all bitwise; resident combine path, 2-8 rows only)
+         const WeightRef* w_sgi = lfuse_on(n) && g_lfuse_gate() ? v.get("ffn_gate_inp_shexp.weight") : nullptr;
+         bool sg_ready = false;
++        bool route_published = false;   // the n == 1 router's fused launch published this group (route_publish)
+         if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10) {
+             try {
+                 if (w_sgi != nullptr)
+@@ -2216,11 +2237,23 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+                                   cs, err))
+                 return false;
+ #endif
+-        } else
++        } else {
++        // the window's single row: the top-10 and the doorbell publish in one node (route_publish).  Only when the
++        // publish is the plain doorbell_publish_res path - route_prior / route_resident rewrite the ids after it.
++        const bool fuse_pub = n == 1 && NE == 512 && K == 10 && native_router_enabled() && !remote_opt_ &&
++                              !always_publish_ && !ar_on() && g_route_prior() <= 0.0f &&
++                              route_resident_cfg().margin <= 0.0f;
+         for (int t = tb; t < te; ++t) {
+             MoEBuffers mb = ss.moe;
+             mb.logits = logits_ + t * NE; mb.ids = ids_ + t * K; mb.weights = w_ + t * K;
+-            if (!moe_route(wt, g, l, K, mb, mixed_ + t * N, cs, err, nullptr)) return false;
++            if (fuse_pub) {
++                const int32_t* layer_res = hits_.d_res != nullptr ? (hits_.d_res + l * g.n_expert) : nullptr;
++                if (!moe_route_publish(wt, g, l, K, mb, mixed_ + t * N, layer_res, (int) g.n_expert,
++                                       m_x_ + tb * N, m_ids_ + tb * K, m_seq_, cs, err))
++                    return false;
++                route_published = true;
++            } else if (!moe_route(wt, g, l, K, mb, mixed_ + t * N, cs, err, nullptr)) return false;
++        }
+         }
+         strata::dispatch::notef("router layer: batched native router=%ld, shared-expert gate in the router launch=%ld, route_prior=%ld", (long) (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10), (long) sg_ready, (long) (g_route_prior() > 0.0f));
+         // STRATA_ROUTE_PRIOR=lambda (changes the output): the top-10 picked again with a logit bonus for the resident
+@@ -2258,7 +2291,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
+ #endif
+             // #578: the helper GPUs reduce with the routing weights - publish them; set_always_publish: the rows
+             // whatever the device's residency table says (pipelined windows)
+-            if (remote_opt_ || always_publish_)
++            if (route_published) {
++                // the n == 1 router's fused launch already published this group (route_publish)
++            } else if (remote_opt_ || always_publish_)
+                 doorbell_publish(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
+                                  m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);
+             else {
+@@ -2843,7 +2878,7 @@ bool Verifier::capture(int T, std::string& err) {
+         for (auto& [k2, c] : kinds) v.push_back({c, k2});
+         std::sort(v.rbegin(), v.rend());
+         std::fprintf(stderr, "strata verify: the %d-token window graph has %zu nodes:", T, nn);
+-        for (size_t i = 0; i < v.size() && i < 40; ++i) std::fprintf(stderr, " %d x %.60s;", v[i].first, v[i].second.c_str());
++        for (size_t i = 0; i < v.size() && i < 200; ++i) std::fprintf(stderr, "\n %4d x %s", v[i].first, v[i].second.c_str());
+         std::fprintf(stderr, "\n");
+ #if CUDART_VERSION >= 12030   // the programmatic (PDL) edges: CUDA allows them only from a kernel node to a kernel node
+         size_t ne = 0;
+diff --git a/src/kernels/cuda/native_router.cu b/src/kernels/cuda/native_router.cu
+index 6611bceb..b420a235 100644
+--- a/src/kernels/cuda/native_router.cu
++++ b/src/kernels/cuda/native_router.cu
+@@ -148,6 +148,86 @@ __global__ void route_multi(const float* __restrict__ logits, int32_t* __restric
+     const float inverse_selected_sum = 1.0f / selected_sum;
+     if (lane < 10) weights[lane] = selected * inverse_selected_sum;
+ }
++// The verify window's n == 1 router with the CPU pool's doorbell in the same launch: warp 0 computes the
++// top-10 exactly as `route` does, then the block publishes x/ids to mapped host memory and rings the sequence.
++// One kernel node fewer per layer; the ids, weights, rows and ring are the separate launches' bytes.
++__launch_bounds__(256, 1)
++__global__ void route_publish(const float* __restrict__ logits, int32_t* __restrict__ ids,
++                              float* __restrict__ weights, const float* __restrict__ x,
++                              const int32_t* __restrict__ d_res, int n_expert, int n, int k,
++                              float* x_out, int32_t* ids_out, uint32_t* seq) {
++    __shared__ int any_miss;
++    const int lane = (int) threadIdx.x;
++    if (threadIdx.y == 0) {
++        float values[16];
++#pragma unroll
++        for (int i = 0; i < 16; ++i) values[i] = logits[lane + i * 32];
++        __syncwarp();
++        float maximum = -INFINITY;
++#pragma unroll
++        for (int i = 0; i < 16; ++i) maximum = max(maximum, values[i]);
++        maximum = warp_max(maximum);
++        float sum = 0.0f;
++#pragma unroll
++        for (int i = 0; i < 16; ++i) {
++            values[i] = expf(values[i] - maximum);
++            sum += values[i];
++        }
++        const float reciprocal = 1.0f / warp_sum(sum);
++#pragma unroll
++        for (int i = 0; i < 16; ++i) {
++            values[i] *= reciprocal;
++            if (__isnanf(values[i])) values[i] = -FLT_MAX;
++        }
++        float selected = 0.0f, selected_sum = 0.0f;
++        for (int rank = 0; rank < 10; ++rank) {
++            float best = values[0];
++            int expert = lane;
++#pragma unroll
++            for (int i = 1; i < 16; ++i) {
++                if (values[i] > best) { best = values[i]; expert = lane + i * 32; }
++            }
++#pragma unroll
++            for (int mask = 16; mask; mask >>= 1) {
++                const float other = __shfl_xor_sync(0xffffffffu, best, mask, 32);
++                const int other_id = __shfl_xor_sync(0xffffffffu, expert, mask, 32);
++                if (other > best || (other == best && other_id < expert)) { best = other; expert = other_id; }
++            }
++            if ((expert & 31) == lane) {
++                values[expert / 32] = -INFINITY;
++                ids[rank] = expert;
++                selected_sum += best;
++            }
++            if (rank == lane) selected = best;
++        }
++        selected_sum = max(warp_sum(selected_sum), 6.103515625e-5f);
++        const float inverse_selected_sum = 1.0f / selected_sum;
++        if (lane < 10) weights[lane] = selected * inverse_selected_sum;
++    }
++    __syncthreads();
++    if (threadIdx.y == 0 && lane == 0) {
++        int miss = 0;
++        for (int r = 0; r < k; ++r) {
++            const int32_t id = ids[r];
++            ids_out[r] = id;
++            if (d_res == nullptr || id < 0 || id >= n_expert || d_res[id] < 0) miss = 1;
++        }
++        any_miss = miss;
++    }
++    __syncthreads();
++    const int tid = (int) threadIdx.y * 32 + (int) threadIdx.x;
++    if (any_miss) {
++        for (int i = tid; i < n; i += 256) x_out[i] = x[i];
++        __threadfence_system();
++    } else if (tid == 0) {
++        __threadfence_system();
++    }
++    __syncthreads();
++    if (tid == 0) {
++        *(volatile uint32_t*) seq = *(volatile uint32_t*) seq + 1u;
++        __threadfence_system();
++    }
++}
+ // The same contract for other (experts, top-k) shapes - Qwen3.6-35B-A3B's 256 / 8 - one warp per token, n_tok tokens
+ // (8 per block).  The 512 / 10 path keeps its own kernels above (the Flash-Next bits), this template is only used
+ // for the other shapes.
+@@ -233,6 +313,18 @@ void native_router_top10_multi(const float* logits, int32_t* ids, float* weights
+     const auto error = cudaGetLastError();
+     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+ }
++void native_router_top10_publish(const float* logits, int32_t* ids, float* weights, const float* x,
++                                 const int32_t* d_res, int n_expert, int n, int k, float* x_out,
++                                 int32_t* ids_out, uint32_t* seq, void* stream) {
++    if (!stream || n_expert != 512 || k != 10 || n < 1 || !valid(logits, 512 * 4) || !valid(ids, 10 * 4) ||
++        !valid(weights, 10 * 4) || !valid(x, (size_t) n * 4) || !valid(x_out, (size_t) n * 4) ||
++        !valid(ids_out, 10 * 4) || seq == nullptr)
++        throw std::invalid_argument("native router (publish) requires a stream, aligned spans and a ring");
++    route_publish<<<1, dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, weights, x, d_res, n_expert, n, k,
++                                                                             x_out, ids_out, seq);
++    const auto error = cudaGetLastError();
++    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
++}
+ bool native_router_topk_supported(int n_expert, int k) { return (n_expert == 512 && k == 10) || (n_expert == 256 && k == 8); }
+ void native_router_topk(const float* logits, int32_t* ids, float* weights, int n_expert, int k, int n_tok, void* stream) {
+     if (n_expert == 512 && k == 10) {   // Flash-Next: the pinned kernels above, unchanged
+diff --git a/src/kernels/native_multi_parity.cpp b/src/kernels/native_multi_parity.cpp
+index 8c925ad9..a3c22d20 100644
+--- a/src/kernels/native_multi_parity.cpp
++++ b/src/kernels/native_multi_parity.cpp
+@@ -93,6 +93,73 @@ int main(int argc, char**) {
+         bad += mode_bad;
+     }
+ 
++    // ---- the n == 1 router with the doorbell folded into the top-10 launch (route_publish): ids and weights
++    // must be native_router_top10's bits; the mapped rows and the ring must be doorbell_publish_res's.  Both
++    // residency outcomes (all resident: the rows stay untouched; a miss: x is copied).
++    for (int mode = 0; mode < 3; ++mode) {
++        const char* names[] = {"random logits", "exact ties", "NaN logits"};
++        const int n_embd = mode == 2 ? 7 : 2560;   // an odd width too: the copy is not float4-sized
++        std::vector<float> lg(512), xv((size_t) n_embd);
++        for (auto& v : lg) v = gauss(rng) * 2.0f;
++        if (mode == 1)
++            for (auto& v : lg) v = (float) (int) (v * 2.0f) * 0.5f;
++        if (mode == 2) lg[rng() % 512] = std::nanf("");
++        for (auto& v : xv) v = gauss(rng);
++        float* d_l = up(lg);
++        float* d_x = up(xv);
++        int32_t* d_ir;
++        float* d_wr;
++        int32_t* d_i;
++        float* d_w;
++        check(cudaMalloc(&d_ir, 10 * 4), "ir");
++        check(cudaMalloc(&d_wr, 10 * 4), "wr");
++        check(cudaMalloc(&d_i, 10 * 4), "i");
++        check(cudaMalloc(&d_w, 10 * 4), "w");
++        native_router_top10(d_l, d_ir, d_wr, st);
++        check(cudaDeviceSynchronize(), "sync ref");
++        const auto ri = down(d_ir, 10);
++        const auto rw = down(d_wr, 10);
++        int32_t* d_io = nullptr;
++        float* d_xo = nullptr;
++        uint32_t* d_seq = nullptr;
++        check(cudaMalloc(&d_io, 10 * 4), "io");
++        check(cudaMalloc(&d_xo, (size_t) n_embd * 4), "xo");
++        check(cudaMalloc(&d_seq, 4), "seq");
++        std::vector<int32_t> res(512, 0);
++        int32_t* d_res = up(res);
++        uint32_t zero = 0;
++        check(cudaMemcpy(d_seq, &zero, 4, cudaMemcpyHostToDevice), "seq0");
++        const std::vector<float> sentinel((size_t) n_embd, -12345.0f);
++        int pbad = 0;
++        for (int miss = 0; miss < 2; ++miss) {
++            std::vector<int32_t> res2(512, 0);
++            if (miss) res2[(size_t) ri[0]] = -1;
++            check(cudaMemcpy(d_res, res2.data(), res2.size() * 4, cudaMemcpyHostToDevice), "res");
++            check(cudaMemcpy(d_xo, sentinel.data(), sentinel.size() * 4, cudaMemcpyHostToDevice), "sent");
++            native_router_top10_publish(d_l, d_i, d_w, d_x, d_res, 512, n_embd, 10, d_xo, d_io, d_seq, st);
++            check(cudaDeviceSynchronize(), "sync fused");
++            const std::vector<int32_t> fi = down(d_i, 10), fio = down(d_io, 10);
++            const std::vector<float> fw = down(d_w, 10);
++            const auto fo = down(d_xo, (size_t) n_embd);
++            uint32_t seq1 = 0;
++            check(cudaMemcpy(&seq1, d_seq, 4, cudaMemcpyDeviceToHost), "seq1");
++            if (std::memcmp(fi.data(), ri.data(), 10 * 4) != 0 || std::memcmp(fw.data(), rw.data(), 10 * 4) != 0 ||
++                std::memcmp(fio.data(), ri.data(), 10 * 4) != 0)
++                ++pbad;
++            if (miss) {
++                if (std::memcmp(fo.data(), xv.data(), xv.size() * 4) != 0) ++pbad;
++            } else {
++                if (std::memcmp(fo.data(), sentinel.data(), sentinel.size() * 4) != 0) ++pbad;
++            }
++            if (seq1 != (uint32_t) (miss + 1)) ++pbad;
++        }
++        std::printf("  %-52s %s\n", (std::string("router+publish n=1, ") + names[mode]).c_str(),
++                    pbad ? "*** NO ***" : "bitwise (ids, weights, rows, ring)");
++        bad += pbad;
++        cudaFree(d_l); cudaFree(d_x); cudaFree(d_ir); cudaFree(d_wr);
++        cudaFree(d_i); cudaFree(d_w); cudaFree(d_io); cudaFree(d_xo); cudaFree(d_seq); cudaFree(d_res);
++    }
++
+     // ---- #1357: a model that does not have 512 experts takes the generic router (the native one reads 512 floats a
+     // row, so mtp.cpp's per-token call is guarded by n_expert == 512 like its siblings): router_top10 on 256-wide
+     // rows picks the host reference's ids in order, with its renormalised softmax weights

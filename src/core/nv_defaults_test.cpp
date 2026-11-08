@@ -36,6 +36,7 @@ int main() {
     unset("STRATA_SM121_PERF");
     unset("STRATA_SM86_PERF");
     unset("STRATA_SM60_PERF");
+    unset("STRATA_SM61_PERF");
     unset("STRATA_EMULATE_CC");
     // GB10 (12.1): the five measured switches, and nothing else
     {
@@ -67,6 +68,28 @@ int main() {
         CHECK(!p.empty() && p == q);
         CHECK(!find(a, "STRATA_PF_FUSED") && !find(p, "STRATA_PF_FUSED"));
     }
+    // Tesla P40 (sm_61): the sm_60 set plus CPU_IQ_ALL_EXACT1 / ATTN_DAILY / QSA_ROWS; all bit-exact, GU_SWIGLU left out
+    {
+        const auto p = nv_default_env(6, 1, false), q = nv_default_env(6, 1, true);
+        CHECK(p.size() == 10);
+        CHECK(p == q);   // STRATA_DEFAULTS=026 does not touch the 2026-11 sm_61 table
+        CHECK(find(p, "STRATA_ADAPT_NOWAIT") && *find(p, "STRATA_ADAPT_NOWAIT") == "1");
+        CHECK(find(p, "STRATA_ADAPT_LAG") && *find(p, "STRATA_ADAPT_LAG") == "2");
+        CHECK(find(p, "STRATA_CPU_IQ_ALL_EXACT1") && *find(p, "STRATA_CPU_IQ_ALL_EXACT1") == "1");
+        CHECK(find(p, "STRATA_SIDE_MIXER") && *find(p, "STRATA_SIDE_MIXER") == "2");
+        CHECK(find(p, "STRATA_FUSE_WAIT") && *find(p, "STRATA_FUSE_WAIT") == "2");
+        CHECK(find(p, "STRATA_B6_MMVQ_ROWS") && *find(p, "STRATA_B6_MMVQ_ROWS") == "1");
+        CHECK(find(p, "STRATA_FUSE_DECODE") && *find(p, "STRATA_FUSE_DECODE") == "1");
+        CHECK(find(p, "STRATA_GR_UP75") && *find(p, "STRATA_GR_UP75") == "1");
+        CHECK(find(p, "STRATA_ATTN_DAILY") && *find(p, "STRATA_ATTN_DAILY") == "1");
+        CHECK(find(p, "STRATA_QSA_ROWS") && *find(p, "STRATA_QSA_ROWS") == "1");
+        CHECK(!find(p, "STRATA_GU_SWIGLU"));   // expert mode 8 already fuses gate/up + SwiGLU + q8_1 on this card
+    }
+    // STRATA_SM61_PERF=0 empties it; a card that is neither 6.0 nor 6.1 gets nothing
+    put("STRATA_SM61_PERF", "0");
+    CHECK(nv_default_env(6, 1, false).empty());
+    unset("STRATA_SM61_PERF");
+    CHECK(nv_default_env(6, 2, false).empty());
     // round 0212: STRATA_MMQ_KQ=1 is a default for compute capability 8.0+ (owner yes 11-03), with its own off switches
     unset("STRATA_NV_KQ_DEFAULT");
     CHECK(kNvKqDefaultOn);

@@ -253,8 +253,8 @@ the slots are filled. Only the CUDA build with `STRATA_EXPERIMENTAL_SM60` has th
 
 ## Tesla P40 (sm_61): what was measured and changed
 
-Three things run differently on compute capability 6.1 by default and a fourth is opt-in. Each gives the same bits as what it
-replaces.
+Three things run differently on compute capability 6.1 by default, a fourth is opt-in, and ten scheduling switches are on by
+default (below). Each gives the same bits as what it replaces.
 
 | Change | What it replaces | Switch |
 | --- | --- | --- |
@@ -269,6 +269,16 @@ library before you set it.
 
 `STRATA_GR_FAST=1` is slower on the P40 below 5 tokens, and `STRATA_PREFILL_CPU_SHARE=auto` and `STRATA_ADAPT_OVERLAP=1` gave
 nothing there.
+
+On a Tesla P40 the engine also turns on ten switches that change only how the work is scheduled, so answers stay bit for bit
+the same: `STRATA_ADAPT_NOWAIT=1`, `STRATA_ADAPT_LAG=2`, `STRATA_CPU_IQ_ALL_EXACT1=1`, `STRATA_SIDE_MIXER=2`,
+`STRATA_FUSE_WAIT=2`, `STRATA_B6_MMVQ_ROWS=1`, `STRATA_FUSE_DECODE=1`, `STRATA_GR_UP75=1`, `STRATA_ATTN_DAILY=1` and
+`STRATA_QSA_ROWS=1`. `STRATA_SM61_PERF=0` turns the whole set off, and a switch you set yourself, to any value, is kept. The
+set is used when every visible card has compute capability 6.1. The sm_86 set's `STRATA_GU_SWIGLU=1` is left out: the P40's
+default expert mode 8 already fuses gate/up, SwiGLU and the q8_1 blocks, and `STRATA_GU_SWIGLU` runs only on the CUDA expert
+layout. The full list and per-switch results are in
+[DETAILS.md](DETAILS.md#rtx-30-series-sm_86-and-tesla-p100-sm_60-bitwise-decode-switches-on-by-default) and
+[optimization/sm61-defaults.md](optimization/sm61-defaults.md).
 
 Two things to know when measuring on such a card:
 
