@@ -1,0 +1,110 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index d273c7c4..1512f8d5 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -2325,7 +2325,7 @@ if(STRATA_NATIVE_EXPERTS)
+     # (CUDA_MODULE_LOADING=EAGER), and these four took ~3.8 MB of VRAM (3 expert slots of IQ3_XXS on a P100) from every
+     # model.  gfx906 (HIP: code objects load on first use) keeps them in strata_mmq.
+     set(_strata_mmq_cuda_types ${_strata_mmq_types})
+-    set(_strata_kq_types q4_k q5_k q5_1 q6_k)
++    set(_strata_kq_types q3_k q4_k q5_k q5_1 q6_k)   # q3_k: the dense GDN projections' STRATA_DENSE_MMQ
+     set(_strata_kq_dso OFF)
+     if(STRATA_MMQ_KQUANTS AND STRATA_HIP_GFX906)
+       list(APPEND _strata_mmq_cuda_types ${_strata_kq_types})
+diff --git a/src/prefill/gemm.cu b/src/prefill/gemm.cu
+index ebc558f5..8368550b 100644
+--- a/src/prefill/gemm.cu
++++ b/src/prefill/gemm.cu
+@@ -1,7 +1,7 @@
+ // src/prefill/gemm.cu - see include/strata/prefill/gemm.hpp.
+ #include "strata/prefill/gemm.hpp"
+ #include "strata/kernels/dequant_bf16.hpp"
+-#if defined(STRATA_PREFILL_MMQ) && defined(__HIPCC__)
++#if defined(STRATA_PREFILL_MMQ)
+ #include "strata/prefill/moe_mmq.hpp"
+ #endif
+ 
+@@ -650,7 +650,7 @@ Gemm::~Gemm() {
+     for (void* e : side_free_)
+         if (e) (void) cudaEventDestroy((cudaEvent_t) e);
+     if (side_stream_) (void) cudaStreamDestroy((cudaStream_t) side_stream_);
+-#if defined(STRATA_PREFILL_MMQ) && defined(__HIPCC__)
++#if defined(STRATA_PREFILL_MMQ)
+     delete static_cast<strata::prefill::mmq::Context*>(mmq_ctx_);
+     if (mmq_buf_) cudaFree(mmq_buf_);
+ #endif
+@@ -1255,7 +1255,7 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
+     STRATA_ABSORB_HIPBLAS_STICKY("cublasGemmEx f16");
+ }
+ 
+-#if defined(STRATA_PREFILL_MMQ) && defined(__HIPCC__)
++#if defined(STRATA_PREFILL_MMQ)
+ bool Gemm::native_mmq(const uint16_t* X, int type, const void* W, float* Y, int64_t T, int64_t N, int64_t K,
+                       int64_t ldy) {
+     namespace mmq = strata::prefill::mmq;
+@@ -1397,7 +1397,7 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
+                              "copied unpadded (no device memory)\n", (long long) ldx, (long long) K);
+         std::exit(1);
+     }
+-#if defined(STRATA_PREFILL_MMQ) && defined(__HIPCC__)
++#if defined(STRATA_PREFILL_MMQ)
+     if (beta == 0.0f && (ldx == 0 || ldx == K) && native_mmq(X, ggml_type, W_blocks, Y, T, N, K, ldy)) return;
+ #endif
+ #ifndef STRATA_USE_HIP
+diff --git a/src/prefill/mmq_kq_lib.cu b/src/prefill/mmq_kq_lib.cu
+index d28b5ddf..9a2f131b 100644
+--- a/src/prefill/mmq_kq_lib.cu
++++ b/src/prefill/mmq_kq_lib.cu
+@@ -1,5 +1,5 @@
+ // src/prefill/mmq_kq_lib.cu - strata_kq, the shared library with llama.cpp's MMQ prompt kernels for the K-quants
+-// (Q4_K, Q5_K, Q5_1, Q6_K: the experts of Unsloth's UD-Q4/Q5/Q6_K_XL files).  MODEL-UPDATE Phase 1: the engine loads
++// (Q4_K, Q5_K, Q5_1, Q6_K: the experts of Unsloth's UD-Q4/Q5/Q6_K_XL files; Q3_K: the dense projections' STRATA_DENSE_MMQ).  MODEL-UPDATE Phase 1: the engine loads
+ // every kernel of its own binary when it starts (CUDA_MODULE_LOADING=EAGER, src/program/generate.cpp), so kernels in
+ // the engine cost every model VRAM; these four instances were ~3.8 MB of sm_60 code (3 expert slots of IQ3_XXS on a
+ // P100).  Here they load only when moe_mmq.cu opens this library - for a model with these experts, before the expert
+@@ -54,6 +54,7 @@ STRATA_KQ_EXPORT int strata_kq_run(int device, int type, const void* args, void*
+         case GGML_TYPE_Q5_K: mul_mat_q_case<GGML_TYPE_Q5_K>(ctx, a, s); break;
+         case GGML_TYPE_Q5_1: mul_mat_q_case<GGML_TYPE_Q5_1>(ctx, a, s); break;
+         case GGML_TYPE_Q6_K: mul_mat_q_case<GGML_TYPE_Q6_K>(ctx, a, s); break;
++        case GGML_TYPE_Q3_K: mul_mat_q_case<GGML_TYPE_Q3_K>(ctx, a, s); break;   // the dense projections (STRATA_DENSE_MMQ)
+         default: return -1;
+     }
+     return (int) cudaGetLastError();
+diff --git a/src/prefill/moe_mmq.cu b/src/prefill/moe_mmq.cu
+index 8a53f122..b96ac90e 100644
+--- a/src/prefill/moe_mmq.cu
++++ b/src/prefill/moe_mmq.cu
+@@ -224,7 +224,7 @@ __global__ void iota_kernel(int32_t* dst, int64_t n) {
+     if (i < n) dst[i] = (int32_t) i;
+ }
+ 
+-#if defined(__HIPCC__)   // #820: only the HIP dense-MMQ path (Gemm::native_mmq) uses these two
++// #820: only the HIP dense-MMQ path (Gemm::native_mmq) uses these two; the same path on CUDA (STRATA_DENSE_MMQ=1) too
+ __global__ void f16_to_f32_kernel(const uint16_t* __restrict__ x, float* __restrict__ y, int64_t n) {
+     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+     if (i < n) y[i] = __half2float(__ushort_as_half(x[i]));
+@@ -335,6 +335,9 @@ bool supported(int t) {
+ #ifdef STRATA_MMQ_KQUANTS
+         // Unsloth's UD-Q4/Q5/Q6_K_XL experts; on HIP also the dense GGUF projections (STRATA_DENSE_MMQ)
+         case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_Q5_1: case GGML_TYPE_Q6_K:
++#if !defined(GGML_USE_HIP)
++        case GGML_TYPE_Q3_K:   // the dense GDN projections' Q3_K weights (STRATA_DENSE_MMQ on CUDA)
++#endif
+             return kq_ok();
+ #endif
+ #if !defined(GGML_USE_HIP)
+@@ -753,7 +756,6 @@ void iota(int32_t* dst, int64_t n, void* stream) {
+     ck(cudaGetLastError(), "iota");
+ }
+ 
+-#if defined(__HIPCC__)
+ void f16_to_f32(const uint16_t* x, float* y, int64_t n, void* stream) {
+     if (n <= 0) return;
+     f16_to_f32_kernel<<<blocks(n), 256, 0, (cudaStream_t) stream>>>(x, y, n);
+@@ -764,6 +766,5 @@ void set_bounds(int32_t* dst, int32_t rows, void* stream) {
+     set_bounds_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(dst, rows);
+     ck(cudaGetLastError(), "set_bounds");
+ }
+-#endif
+ 
+ }  // namespace strata::prefill::mmq

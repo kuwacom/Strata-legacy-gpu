@@ -224,7 +224,7 @@ __global__ void iota_kernel(int32_t* dst, int64_t n) {
     if (i < n) dst[i] = (int32_t) i;
 }
 
-#if defined(__HIPCC__)   // #820: only the HIP dense-MMQ path (Gemm::native_mmq) uses these two
+// #820: only the HIP dense-MMQ path (Gemm::native_mmq) uses these two; the same path on CUDA (STRATA_DENSE_MMQ=1) too
 __global__ void f16_to_f32_kernel(const uint16_t* __restrict__ x, float* __restrict__ y, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] = __half2float(__ushort_as_half(x[i]));
@@ -234,8 +234,6 @@ __global__ void set_bounds_kernel(int32_t* d, int32_t rows) {
     d[0] = 0;
     d[1] = rows;
 }
-
-#endif
 
 unsigned blocks(int64_t n) { return (unsigned) ((n + 255) / 256); }
 
@@ -335,6 +333,9 @@ bool supported(int t) {
 #ifdef STRATA_MMQ_KQUANTS
         // Unsloth's UD-Q4/Q5/Q6_K_XL experts; on HIP also the dense GGUF projections (STRATA_DENSE_MMQ)
         case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_Q5_1: case GGML_TYPE_Q6_K:
+#if !defined(GGML_USE_HIP)
+        case GGML_TYPE_Q3_K:   // the dense GDN projections' Q3_K weights (STRATA_DENSE_MMQ on CUDA)
+#endif
             return kq_ok();
 #endif
 #if !defined(GGML_USE_HIP)
@@ -523,7 +524,12 @@ void Context::run(const Product& p, void* stream) {
         case GGML_TYPE_TQP7: mul_mat_q_case<GGML_TYPE_TQP7>(ctx, a, s); break;
 #endif
 #if defined(STRATA_MMQ_KQUANTS) && defined(STRATA_KQ_DSO)
-        case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_Q6_K: case GGML_TYPE_Q5_1: {
+        // Q3_K: the dense GDN projections' type, in the library next to the engine (STRATA_DENSE_MMQ on CUDA)
+        case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_Q6_K: case GGML_TYPE_Q5_1:
+#if !defined(GGML_USE_HIP)
+        case GGML_TYPE_Q3_K:
+#endif
+        {
             const int e = kq::run((int) t, &a, s);
             if (e != 0) {
                 std::fprintf(stderr, "prefill mmq: the K-quant library failed on type %d (error %d)\n", (int) t, e);
@@ -753,7 +759,6 @@ void iota(int32_t* dst, int64_t n, void* stream) {
     ck(cudaGetLastError(), "iota");
 }
 
-#if defined(__HIPCC__)
 void f16_to_f32(const uint16_t* x, float* y, int64_t n, void* stream) {
     if (n <= 0) return;
     f16_to_f32_kernel<<<blocks(n), 256, 0, (cudaStream_t) stream>>>(x, y, n);
@@ -764,6 +769,5 @@ void set_bounds(int32_t* dst, int32_t rows, void* stream) {
     set_bounds_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(dst, rows);
     ck(cudaGetLastError(), "set_bounds");
 }
-#endif
 
 }  // namespace strata::prefill::mmq
