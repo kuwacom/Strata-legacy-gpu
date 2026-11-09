@@ -89,3 +89,26 @@ A 同士のドリフトは 128K で -0.1%。
 
 生ログ: `~/work/results/hcdown/`（h1）、`~/work/results/hcdown2/`（h2）。
 
+## 8. down + inject の融合カーネル（不採用）
+
+`Gemm::bf16_narrow2`（branch `perf/hc-fused-narrow`、commit `23bc4ce3`）。
+X を 1 回だけ読み、down（BM 64 x BN1 64）と inject（1 スレッド 1 出力）を同じ K ループで出す。
+共有メモリ 9,248 B、`STRATA_HC_DOWN_BF16=2` で有効。
+
+| 指標 | =1（2 回呼び） | =2（融合） | 差 |
+|---|---:|---:|---:|
+| prefill 24K (tok/s) | 678.2 | 679.6 | +0.2% |
+| prefill 128K (tok/s) | 694.7 | 692.3 | -0.35% |
+| hc read down+inject（128K、ms） | 15,415 | **14,699** | -4.6% |
+
+- 位相は 716 ms 減ったが、GPU timeline 195,000 ms に対して 0.37%。end-to-end のノイズ（±0.5%）に埋もれる
+- 融合側は inject を全列タイル（5 タイル）で冗長に計算するため FMA が +6.25% 増え、X の 1 回読みの利得を
+  ほぼ打ち消している
+- 品質: needle 32K / 128K とも found
+- 判定: **不採用**。本番は `STRATA_HC_DOWN_BF16=1` のまま（実績のある 2 回呼び）
+
+### 運用メモ
+
+`STRATA_SET` に入れた値は `state/config/strata/launch-presets/docker.json` の `extra` に永続化され、
+docker の `-e` より優先される。A/B で env を切り替えるときは `-e` ではなく `STRATA_SET` の末尾に足すこと。
+最初の A/B はこれに気づかず B1 が =1 のまま動き、位相が完全一致（12,649 / 2,746 ms）して発覚した。
