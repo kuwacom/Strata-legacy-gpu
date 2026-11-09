@@ -44,6 +44,15 @@ public:
     /// true when bf16() runs its products through FP16 tensor cores here (Turing, STRATA_BF16_TC): where X may be FP16
     bool bf16_converts_x() const;
 
+    /// 1 回の活性変換で 2 つの重み行列: Y1[T, N1] = X . W1^T、Y2[T, N2] = X . W2^T (W は行優先の BF16、Y は FP32)。
+    /// prefill の hyper-connection read の down (N1 = 320) と inject (N2 = 4) は同じ xn16 を読むので、Pascal の
+    /// bf16 -> fp32 変換 (bf16_path() == 2) を共有して 1 回で済ませる。それ以外 (HIP、path 0 / 1) と、変換用の
+    /// バッファが確保できなかったときは bf16(X, W1, ...) と bf16(X, W2, ...) を順に呼ぶだけで、結果は 2 回呼んだ
+    /// ものと bit for bit 同じ (同じ変換・同じスライス・同じ cublasSgemm を同じ順に出している)。beta は 0 のみ。
+    /// false は「何もせず終わった」で、このとき呼び出し側は 2 回呼ぶ (確保に失敗した path 2 だけが返す)。
+    bool bf16_pair(const uint16_t* X, const uint16_t* W1, const uint16_t* W2, float* Y1, float* Y2, int64_t T,
+                   int64_t N1, int64_t N2, int64_t K, int64_t ldy1, int64_t ldy2, int64_t ldx = 0);
+
     /// S (STRATA_HCD_EXACT): the HC down projection (N 320, K 10240) by the WMMA kernel that reproduces hipBLASLt's
     /// solution 1176 / 1177 bit for bit; false (nothing launched) unless hipBLASLt would take one of those for this
     /// shape (so the caller falls back to bf16(), with the same ldx).
@@ -127,6 +136,9 @@ private:
     // RDNA2: FP32 copies of the weight and an activation slice (Gemm::rdna2_sgemm)
     uint16_t* tc_w_ = nullptr;
     int64_t tc_w_elems_ = 0;
+    // bf16_pair(): 2 本目の重みの変換先 (tc_w_ と同じく 2 バイト要素で数える)。1 本目と同時に要るので別に持つ
+    uint16_t* tc_w2_ = nullptr;
+    int64_t tc_w2_elems_ = 0;
     uint16_t* tc_x_ = nullptr;
     int64_t tc_x_elems_ = 0;
     bool native_mmq(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,

@@ -4055,7 +4055,22 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     }
                     hcd = true;
                 }
-                if (!hcd && !hdown && !bf16_proj(m.gemm, wd, m.xn16, m.lo, T, sd, err, 0, m.xn16_lo, ldx != D ? ldx : 0, m.cs, xf16)) return false;
+                // down と inject は同じ xn16 を読む。Pascal の FP32 変換を共有できる形なら Gemm::bf16_pair で
+                // 2 つの GEMM を続けて発行し、inject 側の bf16_proj を省く (gr_silu は down の出力 m.lo を読んで
+                // m.lo16 に書くだけで inject の出力 m.inj には触れないから、inject を down の直後に並べても数値は
+                // 変わらない)。条件を外れたら今までどおり 2 回呼ぶ
+                bool hcpair = false;
+                if (!hcd && !hdown && !xf16 && m.xn16_lo == nullptr && wd->q8_scale == nullptr && wi->q8_scale == nullptr &&
+                    wd->kind == core::WeightKind::Bf16InF32 && wi->kind == core::WeightKind::Bf16InF32 && wd->data &&
+                    wi->data && wd->ne0 == D && wd->ne0 == wi->ne0 && wd->ne1 > 0 && wi->ne1 > 0) {
+                    const bool ct = g_cold.begin();
+                    hcpair = m.gemm.bf16_pair(m.xn16, (const uint16_t*) wd->data, (const uint16_t*) wi->data, m.lo, m.inj,
+                                              T, wd->ne1, wi->ne1, wd->ne0, 0, 0, ldx != D ? ldx : 0);
+                    if (ct && hcpair) g_cold.end("bf16_pair", sd + "+" + si, T, wd->ne1 + wi->ne1, wd->ne0);
+                }
+                if (!hcpair && !hcd && !hdown &&
+                    !bf16_proj(m.gemm, wd, m.xn16, m.lo, T, sd, err, 0, m.xn16_lo, ldx != D ? ldx : 0, m.cs, xf16))
+                    return false;
                 gr_silu(m.lo, m.lo16, T, m.cs, m.lo16_lo);
                 pt.mark(kPfHcUp, cs);
                 bool upmixed = false;
@@ -4087,7 +4102,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 }
                 if (!upmixed && !bf16_proj(m.gemm, wu, m.lo16, m.gated, T, su, err, 0, m.lo16_lo, 0, m.cs)) return false;
                 pt.mark(kPfHcInj, cs);
-                if (!hcd && !bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err, 0, m.xn16_lo, ldx != D ? ldx : 0, m.cs, xf16)) return false;
+                if (!hcpair && !hcd && !bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err, 0, m.xn16_lo, ldx != D ? ldx : 0, m.cs, xf16)) return false;
                 pt.mark(kPfHcMix, cs);
                 if (upmixed) {
                 } else if (gr_unfused()) {

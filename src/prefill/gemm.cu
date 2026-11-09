@@ -662,6 +662,7 @@ Gemm::~Gemm() {
 #endif
     if (handle_) cublasDestroy((cublasHandle_t) handle_);
     if (tc_w_) cudaFree(tc_w_);
+    if (tc_w2_) cudaFree(tc_w2_);
     if (tc_x_) cudaFree(tc_x_);
     if (unpadded_x_) cudaFree(unpadded_x_);
     if (!external_) {
@@ -1166,6 +1167,50 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
        "cublasGemmEx");
     STRATA_ABSORB_HIPBLAS_STICKY("cublasGemmEx");
+}
+
+bool Gemm::bf16_pair(const uint16_t* X, const uint16_t* W1, const uint16_t* W2, float* Y1, float* Y2, int64_t T,
+                     int64_t N1, int64_t N2, int64_t K, int64_t ldy1, int64_t ldy2, int64_t ldx) {
+    if (T <= 0 || N1 <= 0 || N2 <= 0) return false;   // bf16() も何もしない: 2 回呼びと同じなので呼び出し側に任せる
+    if (ldy1 <= 0) ldy1 = N1;
+    if (ldy2 <= 0) ldy2 = N2;
+#if !defined(__HIPCC__) && defined(STRATA_EXPERIMENTAL_SM60)
+    // 共有できるのは X を FP32 に広げる Pascal の path 2 だけ: path 1 は X を FP16 に変換し、その変換は f16() の
+    // 中 (スライスごと) にあるので 1 回にまとめられない。path 2 の bf16() は ldx を使わない (行の間隔は常に K) ので
+    // ここでも X は K 間隔で読み、2 回呼んだときと同じデータ・同じ cublasSgemm になる
+    if (K > 0 && bf16_path() == 2) {
+        // bf16() が最初に試すのと同じ大きさ (重みは全 N、活性は kXSliceElems のスライス) を先に取る: これが取れれば
+        // bf16() も同じ要求で取れるので、タイルの割り方が 2 回呼びと一致し、結果が bit for bit 同じになる
+        const int64_t x_rows = std::max<int64_t>(1, std::min<int64_t>(T, kXSliceElems / K));
+        if (!grow(tc_w_, tc_w_elems_, 2 * N1 * K) || !grow(tc_w2_, tc_w2_elems_, 2 * N2 * K) ||
+            !grow(tc_x_, tc_x_elems_, 2 * x_rows * K)) {
+            return false;   // VRAM が足りない: bf16() を 2 回 (そちらは自分でタイルを縮める)
+        }
+        const float alpha = 1.0f;
+        const float beta = 0.0f;
+        float* const w1f = reinterpret_cast<float*>(tc_w_);
+        float* const w2f = reinterpret_cast<float*>(tc_w2_);
+        float* const xf = reinterpret_cast<float*>(tc_x_);
+        bf16_to_f32(W1, w1f, N1 * K, (cudaStream_t) stream_);
+        bf16_to_f32(W2, w2f, N2 * K, (cudaStream_t) stream_);
+        for (int64_t t0 = 0; t0 < T; t0 += x_rows) {
+            const int64_t n = std::min<int64_t>(x_rows, T - t0);
+            // この変換 1 回を 2 つの GEMM が共有する: 2 回呼ぶと、同じスライスを同じ値でもう一度書いていた
+            bf16_to_f32(X + t0 * K, xf, n * K, (cudaStream_t) stream_);
+            ck(cublasSgemm((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N1, (int) n, (int) K, &alpha, w1f,
+                           (int) K, xf, (int) K, &beta, Y1 + t0 * ldy1, (int) ldy1),
+               "cublasSgemm (bf16 pair 1)");
+            ck(cublasSgemm((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N2, (int) n, (int) K, &alpha, w2f,
+                           (int) K, xf, (int) K, &beta, Y2 + t0 * ldy2, (int) ldy2),
+               "cublasSgemm (bf16 pair 2)");
+        }
+        return true;
+    }
+#endif
+    // どの経路でも 2 回呼びが「今までの結果」: そのまま順に呼ぶ
+    bf16(X, W1, Y1, T, N1, K, ldy1, 0.0f, ldx);
+    bf16(X, W2, Y2, T, N2, K, ldy2, 0.0f, ldx);
+    return true;
 }
 
 void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
