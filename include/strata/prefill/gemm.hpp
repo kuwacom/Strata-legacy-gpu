@@ -53,6 +53,16 @@ public:
     bool bf16_pair(const uint16_t* X, const uint16_t* W1, const uint16_t* W2, float* Y1, float* Y2, int64_t T,
                    int64_t N1, int64_t N2, int64_t K, int64_t ldy1, int64_t ldy2, int64_t ldx = 0);
 
+    /// N の狭い射影を BF16 のまま読む自前カーネル (STRATA_HC_DOWN_BF16、CUDA の Pascal だけが受ける)。
+    /// Pascal の bf16() は活性と重みを FP32 に広げてから cublasSgemm に渡すので、hyper-connection read の down
+    /// (N 320, K 10240) は 1 回の read ごとに T x K 個の活性を FP32 にして書いて読み直していた (T 8192 で 335 MB
+    /// を 2 回)。ここでは BF16 のタイルを共有メモリに置き、レジスタで float に広げて FMA する (累積は FP32)。
+    /// 条件を満たすときだけ起動して true、満たさなければ何も書かずに false を返す (呼び出し側は bf16() /
+    /// bf16_pair() に落ちる): N <= 512、K % 32 == 0、T >= 64、beta 0 のみ (累積しない)、ldy == N、X と W は BF16。
+    /// K の和の順序が cuBLAS と違うので bitwise ではない (gemm_bf16_parity 相当の比較で確かめる)。
+    bool bf16_narrow(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,
+                     void* stream = nullptr);
+
     /// S (STRATA_HCD_EXACT): the HC down projection (N 320, K 10240) by the WMMA kernel that reproduces hipBLASLt's
     /// solution 1176 / 1177 bit for bit; false (nothing launched) unless hipBLASLt would take one of those for this
     /// shape (so the caller falls back to bf16(), with the same ldx).

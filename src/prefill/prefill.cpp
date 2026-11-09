@@ -568,6 +568,14 @@ inline bool hcd_exact() {
     return v;
 }
 inline bool hc_pad() { return pf_hcdown() || hcd_exact(); }
+// STRATA_HC_DOWN_BF16=1: the hyper-connection read's down projection (N 320, K 10240) by Gemm::bf16_narrow - a BF16
+// kernel that reads the activations where they are (Pascal's bf16() widens them to T x K FP32 values, 335 MB at
+// T = 8192, and reads them back: 2.2 ms of the 10.1 ms a read takes).
+// 累積の順序が cuBLAS と変わるので bitwise ではない。bf16_pair とも排他 (下の hc read を参照)
+inline bool hc_down_bf16() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_HC_DOWN_BF16"); return e != nullptr && e[0] == '1'; }();
+    return v;
+}
 // STRATA_QSA_FUSE_NR (default on, =0 runs rms_rows + rope [+ split_q] as separate kernels): the QSA layer's K, query and
 // indexer-query norm + rotary in one pass each (strata::prefill::rms_rope_rows; the same bits as the chain it replaces).
 // STRATA_QSA_FUSE_GATE (default on, =0 keeps the separate gate_attn pass): the attention output gate sigmoid(gate) * O in the
@@ -4059,8 +4067,23 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 // 2 つの GEMM を続けて発行し、inject 側の bf16_proj を省く (gr_silu は down の出力 m.lo を読んで
                 // m.lo16 に書くだけで inject の出力 m.inj には触れないから、inject を down の直後に並べても数値は
                 // 変わらない)。条件を外れたら今までどおり 2 回呼ぶ
+                // STRATA_HC_DOWN_BF16=1: down を BF16 のまま読む自前カーネル (Gemm::bf16_narrow) で行う。Pascal の
+                // bf16() は活性を FP32 に広げてから cublasSgemm に渡すので、1 回の read で T x K 個の活性を
+                // FP32 にして書いて読み直していた (T 8192 で 335 MB を 2 回)。bf16_pair とは排他にする: 変換を
+                // 共有する相手 (inject) は N が 4 しかなく、down の変換を丸ごと省く方が大きい (inject は下で
+                // 1 回だけ bf16_proj を呼ぶ)。
+                // 条件を満たさない (Pascal でない、ldx が詰まっていない、など) ときは false が返るので、以降は
+                // 今までどおり bf16_pair / bf16_proj に落ちる
+                bool hcnarrow = false;
+                if (!hcd && !hdown && hc_down_bf16() && !xf16 && m.xn16_lo == nullptr && ldx == D &&
+                    wd->q8_scale == nullptr && wd->kind == core::WeightKind::Bf16InF32 && wd->data != nullptr &&
+                    wd->ne0 == D && wd->ne1 == LR) {
+                    const bool ct = g_cold.begin();
+                    hcnarrow = m.gemm.bf16_narrow(m.xn16, (const uint16_t*) wd->data, m.lo, T, LR, D, 0, m.cs);
+                    if (ct && hcnarrow) g_cold.end("bf16_narrow", sd, T, LR, D);
+                }
                 bool hcpair = false;
-                if (!hcd && !hdown && !xf16 && m.xn16_lo == nullptr && wd->q8_scale == nullptr && wi->q8_scale == nullptr &&
+                if (!hcd && !hdown && !hcnarrow && !xf16 && m.xn16_lo == nullptr && wd->q8_scale == nullptr && wi->q8_scale == nullptr &&
                     wd->kind == core::WeightKind::Bf16InF32 && wi->kind == core::WeightKind::Bf16InF32 && wd->data &&
                     wi->data && wd->ne0 == D && wd->ne0 == wi->ne0 && wd->ne1 > 0 && wi->ne1 > 0) {
                     const bool ct = g_cold.begin();
@@ -4068,7 +4091,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                               T, wd->ne1, wi->ne1, wd->ne0, 0, 0, ldx != D ? ldx : 0);
                     if (ct && hcpair) g_cold.end("bf16_pair", sd + "+" + si, T, wd->ne1 + wi->ne1, wd->ne0);
                 }
-                if (!hcpair && !hcd && !hdown &&
+                if (!hcnarrow && !hcpair && !hcd && !hdown &&
                     !bf16_proj(m.gemm, wd, m.xn16, m.lo, T, sd, err, 0, m.xn16_lo, ldx != D ? ldx : 0, m.cs, xf16))
                     return false;
                 gr_silu(m.lo, m.lo16, T, m.cs, m.lo16_lo);

@@ -1213,6 +1213,140 @@ bool Gemm::bf16_pair(const uint16_t* X, const uint16_t* W1, const uint16_t* W2, 
     return true;
 }
 
+#if !defined(__HIPCC__)
+// ---- STRATA_HC_DOWN_BF16=1 (Gemm::bf16_narrow): the hyper-connection read's down projection ---------------------
+// N = 320 with K = 10240 is narrow: on Pascal the ordinary path widens the weight and the activations to FP32 and runs
+// cublasSgemm, and one read at T = 8192 writes and reads back T x K FP32 activations (335 MB each way, 2.2 ms of a
+// 10.1 ms call: STRATA_COLD_TRACE=1, Tesla P40), on a GEMM whose 320 columns give cuBLAS little to work with.  This
+// kernel reads both operands where they are: the BF16 tile goes to shared memory, each thread widens the values it
+// needs with a shift (the bits of a BF16 ARE the top half of its float) and accumulates in FP32.  Same inputs, same
+// FP32 accumulation - but the k loop sums in its own order, so the result is not bitwise the cuBLAS call's.
+namespace {
+constexpr int kNarrowBM = 64;   // Y の行 (X のトークン) のタイル
+constexpr int kNarrowBN = 64;   // Y の列 (W の行) のタイル: N = 320 は 5 タイルで割り切れる
+constexpr int kNarrowBK = 32;   // K のタイル: 受け付けるのは K % 32 == 0 の形だけ (端の処理が要らない)
+constexpr int kNarrowThreads = 256;
+constexpr int kNarrowTM = 4;    // 1 スレッドの出力 4 行
+constexpr int kNarrowTN = 4;    // 1 スレッドの出力 4 列 (16 x 16 のスレッド格子で 64 x 64 を覆う)
+// 行の長さ (要素) は 8 B の倍数にする (タイルは 8 B 単位の uint2 で読み書きするので、行の先頭が 8 B 境界に来る):
+// - X (64 x 32 -> 64 x 36): 32 のままだと 1 ワープが読む 2 つの行 (4 行差 = 4 x 64 B = 256 B) が同じバンクに落ちる。
+//   36 なら 4 行差が 4 x 72 B になってバンクが 8 つずれ、2 つの行は衝突しない
+// - W (32 x 64 -> 32 x 68) は [k][n] に置く。1 ワープの 16 列のスレッドが読む 4 行差のアドレスは、[n][k] のままだと
+//   4 x 64 B がすべて同じバンクに落ちて 16 重衝突になる。[k][n] なら 1 命令 (16 スレッド x 8 B) が 32 バンクに散り、
+//   同じ値を読む 2 スレッド (16 列 x 2 行のワープ) は broadcast になる
+// 共有メモリは 64 x 36 x 2 + 32 x 68 x 2 = 8,960 B で、48 KB の上限に十分収まる (登録数から 4 ブロック/SM 前後)
+constexpr int kNarrowXRow = 36;
+constexpr int kNarrowWRow = 68;
+__device__ __forceinline__ float narrow_bf16(uint16_t v) {   // BF16 -> float はビットの移動だけで、値は変わらない
+    return __uint_as_float((uint32_t) v << 16);
+}
+__global__ void __launch_bounds__(kNarrowThreads) bf16_narrow_kernel(const uint16_t* __restrict__ X,
+                                                                    const uint16_t* __restrict__ W,
+                                                                    float* __restrict__ Y, int T, int N, int K) {
+    __shared__ uint16_t xs[kNarrowBM][kNarrowXRow];
+    __shared__ uint16_t ws[kNarrowBK][kNarrowWRow];
+    const int row0 = (int) blockIdx.y * kNarrowBM;
+    const int col0 = (int) blockIdx.x * kNarrowBN;
+    // タイルの読み込みの分担: X は 8 B ずつ (64 行 x 8 本 = 512 本を 2 回)、W は 16 B ずつ (64 行 x 4 本 = 256 本)
+    const int xr = threadIdx.x / 8, xc = (threadIdx.x % 8) * 4;
+    const int wr = threadIdx.x / 4, wc = (threadIdx.x % 4) * 8;
+    const int tx = threadIdx.x % 16, ty = threadIdx.x / 16;
+    float acc[kNarrowTM][kNarrowTN] = {};
+    for (int k0 = 0; k0 < K; k0 += kNarrowBK) {
+        // X のタイル: T の外の行は 0 を置く (その行の出力は最後に書かない)
+        #pragma unroll
+        for (int pass = 0; pass < 2; ++pass) {
+            const int r = xr + pass * 32;
+            const uint2 v = row0 + r < T ? *(const uint2*) (X + (int64_t) (row0 + r) * K + k0 + xc)
+                                         : make_uint2(0u, 0u);
+            *(uint2*) &xs[r][xc] = v;
+        }
+        // W のタイル: グローバルは行優先のまま 16 B で読み、共有メモリには [k][n] に置く
+        const uint4 wv = col0 + wr < N ? *(const uint4*) (W + (int64_t) (col0 + wr) * K + k0 + wc)
+                                       : make_uint4(0u, 0u, 0u, 0u);
+        // 8 値を個別に置く (uint4 のアドレスを取らない: ローカルメモリに落とさないため)
+        ws[wc + 0][wr] = (uint16_t) wv.x;
+        ws[wc + 1][wr] = (uint16_t) (wv.x >> 16);
+        ws[wc + 2][wr] = (uint16_t) wv.y;
+        ws[wc + 3][wr] = (uint16_t) (wv.y >> 16);
+        ws[wc + 4][wr] = (uint16_t) wv.z;
+        ws[wc + 5][wr] = (uint16_t) (wv.z >> 16);
+        ws[wc + 6][wr] = (uint16_t) wv.w;
+        ws[wc + 7][wr] = (uint16_t) (wv.w >> 16);
+        __syncthreads();
+        // 4 つの k をまとめて読む (1 命令で 4 値)。1 k ずつ 4 値を読むと LDS の命令数が FMA の 2 倍になり、
+        // この形の GEMM は共有メモリの命令で頭打ちになる (4 x 4 タイルで FMA 1 回あたり 1 B 読むため)
+        #pragma unroll
+        for (int k4 = 0; k4 < kNarrowBK; k4 += 4) {
+            float a[kNarrowTM][4];
+            #pragma unroll
+            for (int i = 0; i < kNarrowTM; ++i) {
+                const uint2 av = *(const uint2*) &xs[ty * kNarrowTM + i][k4];
+                a[i][0] = narrow_bf16((uint16_t) av.x);
+                a[i][1] = narrow_bf16((uint16_t) (av.x >> 16));
+                a[i][2] = narrow_bf16((uint16_t) av.y);
+                a[i][3] = narrow_bf16((uint16_t) (av.y >> 16));
+            }
+            #pragma unroll
+            for (int kk = 0; kk < 4; ++kk) {
+                const uint2 bv = *(const uint2*) &ws[k4 + kk][tx * kNarrowTN];
+                const float b0 = narrow_bf16((uint16_t) bv.x), b1 = narrow_bf16((uint16_t) (bv.x >> 16));
+                const float b2 = narrow_bf16((uint16_t) bv.y), b3 = narrow_bf16((uint16_t) (bv.y >> 16));
+                #pragma unroll
+                for (int i = 0; i < kNarrowTM; ++i) {
+                    const float ai = a[i][kk];
+                    acc[i][0] += ai * b0;
+                    acc[i][1] += ai * b1;
+                    acc[i][2] += ai * b2;
+                    acc[i][3] += ai * b3;
+                }
+            }
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (int i = 0; i < kNarrowTM; ++i) {
+        const int y = row0 + ty * kNarrowTM + i;
+        if (y >= T) continue;
+        #pragma unroll
+        for (int j = 0; j < kNarrowTN; ++j) {
+            const int x = col0 + tx * kNarrowTN + j;
+            if (x < N) Y[(int64_t) y * N + x] = acc[i][j];   // ldy == N だけを受ける (条件) ので詰めて書ける
+        }
+    }
+}
+}  // namespace
+#endif
+
+bool Gemm::bf16_narrow(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
+                       void* stream) {
+    if (T < 64 || N <= 0 || N > 512 || K <= 0 || K % kNarrowBK != 0) return false;
+    if (ldy <= 0) ldy = N;
+    if (ldy != N || X == nullptr || W == nullptr || Y == nullptr) return false;
+#if defined(__HIPCC__)
+    (void) stream;
+    return false;   // この経路は Pascal の FP32 変換を置き換えるもの: RDNA には別の道がある (rdna2_sgemm)
+#else
+    if (bf16_path() != 2) return false;   // BF16 のテンソルコアがあるカードは cuBLAS の生の呼び出しの方が速い
+    // タイルの読み込みは 16 B / 8 B のベクトル読みなので、ポインタの境界を確かめる (重みは確保した領域の一部)
+    if (((reinterpret_cast<uintptr_t>(X) | reinterpret_cast<uintptr_t>(W)) % 16) != 0 ||
+        (reinterpret_cast<uintptr_t>(Y) % 4) != 0)
+        return false;
+    if (T > (int64_t) INT_MAX || N > (int64_t) INT_MAX || K > (int64_t) INT_MAX) return false;
+    const dim3 grid((unsigned) ((N + kNarrowBN - 1) / kNarrowBN), (unsigned) ((T + kNarrowBM - 1) / kNarrowBM));
+    static bool said = false;
+    if (!said) {
+        said = true;
+        std::fprintf(stderr, "prefill gemm: the hyper-connection down projection runs through the BF16 narrow kernel "
+                             "(STRATA_HC_DOWN_BF16=1; the activations are never widened to FP32)\n");
+    }
+    bf16_narrow_kernel<<<grid, kNarrowThreads, 0, (cudaStream_t) (stream != nullptr ? stream : stream_)>>>(
+        X, W, Y, (int) T, (int) N, (int) K);
+    if (cudaGetLastError() != cudaSuccess) return false;   // 何も書いていない: 呼び出し側は従来の経路に落ちる
+    return true;
+#endif
+}
+
 void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
                float beta) {
     if (T <= 0 || N <= 0) return;
