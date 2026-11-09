@@ -15,12 +15,12 @@ configuration (`fork-v3`, engine 0.1.57) gives:
 
 | Metric | Before | After | Change |
 |---|---:|---:|---:|
-| prefill 24K (tok/s) | 485 | 595 | **+22.6%** |
-| prefill 128K (tok/s) | 434 | 586 | **+35.1%** |
-| TTFT 24K (s) | 57.9 | 47.2 | -18.5% |
-| TTFT 128K (s) | 278.0 | 205.7 | -26.0% |
-| TTFT 480K (s) | ~1,532 | 889.5 | **-42%** |
-| prefill 480K (tok/s) | ~303 | 528.7 | **+74%** |
+| prefill 24K (tok/s) | 485 | 630 | **+30%** |
+| prefill 128K (tok/s) | 434 | 625 | **+44%** |
+| TTFT 24K (s) | 57.9 | 39.5 | -32% |
+| TTFT 128K (s) | 278.0 | 215.1 | -23% |
+| TTFT 480K (s) | ~1,532 | 837.4 | **-45%** |
+| prefill 480K (tok/s) | ~303 | 561.6 | **+85%** |
 | decode 4K code / prose (tok/s) | 52.3 / 43.3 | 52.5 / 43.3 | no change |
 | decode 24K code / prose (tok/s) | 50.3 / 43.6 | 51.9 / 44.5 | noise |
 
@@ -34,7 +34,8 @@ base and final was within base-vs-base noise, with identical top-1 tokens.
 CONTEXT=512k
 STRATA_SET="ple-io=ram prefill=auto STRATA_DENSE_F32=1 \
   rope-scaling=yarn rope-scale=2 \
-  STRATA_DENSE_MMQ=1 STRATA_MMQ_KQ=1 spec=4"
+  STRATA_DENSE_MMQ=1 STRATA_MMQ_KQ=1 spec=4 \
+  STRATA_PATTN_SM60=1"
 ```
 
 Engine flags observed at startup:
@@ -58,11 +59,12 @@ cells stay in VRAM. RoPE scaling is YaRN with factor 2.
 | DP4A MMQ I=128 tiles for J=64 rows | prefill +3.1% | Bitwise; limited to types that fit 48 KB shared memory |
 | sm_61 bitwise default switch set | decode +2.5% | 10 existing switches, enabled by architecture |
 | Router/publish and wait/copy fusion | 97 fewer graph nodes per token | Bitwise; no measurable speed change |
+| `STRATA_PATTN_SM60=1` | prefill +6.6 to +7.1% | Bitwise against the prompt attention path; needle/QA unchanged |
 
 ## Changes that were rejected
 
-- `STRATA_PATTN_SM60=1`: prefill +6.5% but changed real answers in 2 of 4 prompts;
-  held back pending a larger quality evaluation.
+- `--draft-conf 0.5`: the apparent +7.7% did not reproduce; the difference was inside
+  A-vs-A drift, effective gain was about +2%, and output is not invariant.
 - `STRATA_KV_PREFETCH=1`: +0.8% (KV upload is only ~0.35% of a 128K prefill on this GPU).
 - `STRATA_KVA=1`: not applicable with the DFlash2 drafter.
 - CPU expert pool look-ahead: waitCPU scales with CPU expert count (memory-bandwidth
