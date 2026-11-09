@@ -15,10 +15,10 @@ configuration (`fork-v3`, engine 0.1.57) gives:
 
 | Metric | Before | After | Change |
 |---|---:|---:|---:|
-| prefill 24K (tok/s) | 485 | 682 | **+41%** |
-| prefill 128K (tok/s) | 434 | 695 | **+60%** |
-| TTFT 24K (s) | 57.9 | 36.2 | -37% |
-| TTFT 128K (s) | 278.0 | 197.8 | -29% |
+| prefill 24K (tok/s) | 485 | 692 | **+43%** |
+| prefill 128K (tok/s) | 434 | 705 | **+62%** |
+| TTFT 24K (s) | 57.9 | 35.7 | -38% |
+| TTFT 128K (s) | 278.0 | 194.7 | -30% |
 | TTFT 480K (s) | ~1,532 | 837.4 | **-45%** |
 | prefill 480K (tok/s) | ~303 | 561.6 | **+85%** |
 | decode 4K code / prose (tok/s) | 52.3 / 43.3 | 52.5 / 43.3 | no change |
@@ -64,6 +64,7 @@ cells stay in VRAM. RoPE scaling is YaRN with factor 2.
 | `STRATA_SELECT_SIMT=1` | prefill +1.7% at 128K | Different summation order in the block selector; needle/QA unchanged |
 | hc down+inject share one bf16->fp32 conversion | ~1% (inside the combined result) | Bitwise; `gemm_bf16_parity` 0 failures |
 | `STRATA_HC_DOWN_BF16=1` (narrow BF16 kernel for hc down/inject) | 128K prefill +1.4%; the hc pair -18% | Not bitwise (K summation order, rel RMS ~3.5e-6); needle/QA passed |
+| `__launch_bounds__(64, 8)` on the QSA value kernel | 128K prefill +1.45%; `qsa attn` -10.9% | Bitwise; 151->128 registers, 6->8 CTAs an SM (`qsa_pattn_parity` 468 cases) |
 
 ## Changes that were rejected
 
