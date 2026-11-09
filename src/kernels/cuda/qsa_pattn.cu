@@ -253,10 +253,23 @@ __global__ void __launch_bounds__(THREADS, 2) ps_score_x_kernel(const float* __r
 // ps_value_d4_kernel: the value kernel with four dims a thread (64 threads, one CTA per (KV head, query)): a cell's four
 // codes are one 32-bit load (a warp reads 128 contiguous bytes), its 12 weights three broadcast float4 reads for 48
 // fmaf.  V loads run four cells ahead.  Per (dim, head) the fold and the merge are ps_value_kernel's.
-__global__ void __launch_bounds__(64) ps_value_d4_kernel(QsaAttnPools p, const int32_t* __restrict__ steps,
-                                                         const float* __restrict__ blocks, int n_kv_heads, int n_chunks,
-                                                         float* __restrict__ attn) {
-    constexpr int NT = 64;
+//
+// 並列度: 上の 64 スレッド / 12 head は PR 当時の形。1 CTA は (KV head, クエリ) の 1 組で CTA 数は ~214 しかなく、
+// 60 SM に 64 スレッドを配ると 1 SM あたり ~7 ワープ (スレッド枠の ~11%) しか埋まらない。セル方向の折り畳みは
+// (dim, head) ごとの直列な fmaf 連鎖なので分割できないが、head どうしは独立なので 12 head を PSV_NHG 群に分け、
+// 1 スレッドを 4 dim x (G / PSV_NHG) head にしてスレッド数を PSV_NT にする。CTA 数は変えないので、増えたスレッドが
+// そのままワープ数 (11% -> 22%) になり、1 スレッドの acc / a も 96 本から 48 本に減る。head ごとの積和は cell の
+// 昇順も fmaf の順序も変えないので、出力は bit for bit 同じ。
+constexpr int PSV_NT = 128;                 // threads a CTA: PSV_NHG head groups x PSV_DG dim groups
+constexpr int PSV_DG = HD / 4;              // dim groups (four dims a thread, as before)
+constexpr int PSV_NHG = PSV_NT / PSV_DG;    // head groups, each folding its own accumulators
+constexpr int PSV_HG = G / PSV_NHG;         // heads a thread
+static_assert(PSV_DG * PSV_NHG == PSV_NT && G % PSV_NHG == 0, "ps_value_d4_kernel: PSV_NT / PSV_DG must divide G");
+
+__global__ void __launch_bounds__(PSV_NT) ps_value_d4_kernel(QsaAttnPools p, const int32_t* __restrict__ steps,
+                                                             const float* __restrict__ blocks, int n_kv_heads,
+                                                             int n_chunks, float* __restrict__ attn) {
+    constexpr int NT = PSV_NT;
     const int kvh = blockIdx.x, z = blockIdx.y;
     const int t = threadIdx.x;
     const float* const blk0 = blocks + ((size_t) z * n_kv_heads + kvh) * n_chunks * PS_BLK;
@@ -286,10 +299,13 @@ __global__ void __launch_bounds__(64) ps_value_d4_kernel(QsaAttnPools p, const i
         }
         sL[t] = L;
     }
-    const int d0 = 4 * t, g = d0 / KV_Q8_GROUP;
-    float acc[4][G];
+    // four dims and PSV_HG heads a thread: the dim group is the low part of the thread index, the head group the high
+    // part, so a warp reads 128 contiguous bytes of V and its weights are one broadcast address
+    const int d0 = 4 * (t % PSV_DG), g = d0 / KV_Q8_GROUP;
+    const int h0 = (t / PSV_DG) * PSV_HG;
+    float acc[4][PSV_HG];
 #pragma unroll
-    for (int h = 0; h < G; ++h)
+    for (int h = 0; h < PSV_HG; ++h)
 #pragma unroll
         for (int d = 0; d < 4; ++d) acc[d][h] = 0.0f;
     for (int c = 0; c < n_act; ++c) {
@@ -299,9 +315,12 @@ __global__ void __launch_bounds__(64) ps_value_d4_kernel(QsaAttnPools p, const i
         if (t == 0) s_masked = 0;
         __syncthreads();
         {
-            const long long r = __ldg(reinterpret_cast<const long long*>(blk + G * CHUNK) + t);
-            srow[t] = r;
-            if (t < n_here && r < 0) s_masked = 1;
+            // CHUNK rows of the block go to shared memory; with NT > CHUNK the first CHUNK threads do it
+            if (t < CHUNK) {
+                const long long r = __ldg(reinterpret_cast<const long long*>(blk + G * CHUNK) + t);
+                srow[t] = r;
+                if (t < n_here && r < 0) s_masked = 1;
+            }
         }
 #pragma unroll
         for (int j = 0; j < G * CHUNK / NT; ++j) {
@@ -309,23 +328,24 @@ __global__ void __launch_bounds__(64) ps_value_d4_kernel(QsaAttnPools p, const i
             spt[cell][h] = __ldg(blk + idx);
         }
         __syncthreads();
-        float a[4][G];
+        float a[4][PSV_HG];
 #pragma unroll
-        for (int h = 0; h < G; ++h)
+        for (int h = 0; h < PSV_HG; ++h)
 #pragma unroll
             for (int d = 0; d < 4; ++d) a[d][h] = 0.0f;
         const auto fold4 = [&](int cl, uint32_t codes, float sc) {
             const float v0 = (float) (int8_t) (codes & 0xFF) * sc, v1 = (float) (int8_t) ((codes >> 8) & 0xFF) * sc;
             const float v2 = (float) (int8_t) ((codes >> 16) & 0xFF) * sc, v3 = (float) (int8_t) (codes >> 24) * sc;
-            const float4* w4 = reinterpret_cast<const float4*>(spt[cl]);
-            const float4 w0 = w4[0], w1 = w4[1], w2 = w4[2];
-            const float ww[G] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w, w2.x, w2.y, w2.z, w2.w};
+            // only this thread's head group: h0 is uniform across a warp, so the six reads are broadcasts (the
+            // full 12-wide float4s of the 64-thread form would be the same three loads for half the fmaf)
+            const float* const wrow = spt[cl] + h0;
 #pragma unroll
-            for (int h = 0; h < G; ++h) {
-                a[0][h] = fmaf(ww[h], v0, a[0][h]);
-                a[1][h] = fmaf(ww[h], v1, a[1][h]);
-                a[2][h] = fmaf(ww[h], v2, a[2][h]);
-                a[3][h] = fmaf(ww[h], v3, a[3][h]);
+            for (int h = 0; h < PSV_HG; ++h) {
+                const float w = wrow[h];
+                a[0][h] = fmaf(w, v0, a[0][h]);
+                a[1][h] = fmaf(w, v1, a[1][h]);
+                a[2][h] = fmaf(w, v2, a[2][h]);
+                a[3][h] = fmaf(w, v3, a[3][h]);
             }
         };
         const auto vld = [&](int cl, uint32_t& codes, float& sc) {
@@ -361,9 +381,9 @@ __global__ void __launch_bounds__(64) ps_value_d4_kernel(QsaAttnPools p, const i
             }
         }
 #pragma unroll
-        for (int h = 0; h < G; ++h) {
-            const bool live = !(sm_m[c][h] == -FLT_MAX);
-            const float w = sm_w[c][h];
+        for (int h = 0; h < PSV_HG; ++h) {
+            const bool live = !(sm_m[c][h0 + h] == -FLT_MAX);
+            const float w = sm_w[c][h0 + h];
 #pragma unroll
             for (int d = 0; d < 4; ++d) {
                 const float acc_next = fmaf(a[d][h], w, acc[d][h]);
@@ -374,9 +394,9 @@ __global__ void __launch_bounds__(64) ps_value_d4_kernel(QsaAttnPools p, const i
     __syncthreads();
     float* out = attn + ((size_t) z * n_kv_heads + kvh) * G * HD;
 #pragma unroll
-    for (int h = 0; h < G; ++h) {
-        const float L = sL[h];
-        *reinterpret_cast<float4*>(out + (size_t) h * HD + d0) =
+    for (int h = 0; h < PSV_HG; ++h) {
+        const float L = sL[h0 + h];
+        *reinterpret_cast<float4*>(out + (size_t) (h0 + h) * HD + d0) =
             make_float4(L > 0.0f ? acc[0][h] / L : 0.0f, L > 0.0f ? acc[1][h] / L : 0.0f,
                         L > 0.0f ? acc[2][h] / L : 0.0f, L > 0.0f ? acc[3][h] / L : 0.0f);
     }
@@ -432,8 +452,8 @@ bool qsa_pattn_batch_any_arch(const float* q, const QsaAttnPools& pools, const i
         const int32_t* sb = steps + (size_t) t0 * kStepCount;
         ps_score_x_kernel<1><<<g1, THREADS, 0, st>>>(qb, pools, ib, sb, (int) s.n_head_kv, (int) s.page_size, scale,
                                                      scratch, n_chunks, (int) cap);
-        ps_value_d4_kernel<<<g2, 64, 0, st>>>(pools, sb, scratch, (int) s.n_head_kv, n_chunks,
-                                              attn + (size_t) t0 * s.n_head * HD);
+        ps_value_d4_kernel<<<g2, PSV_NT, 0, st>>>(pools, sb, scratch, (int) s.n_head_kv, n_chunks,
+                                                  attn + (size_t) t0 * s.n_head * HD);
     }
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
