@@ -82,6 +82,9 @@ cells stay in VRAM. RoPE scaling is YaRN with factor 2.
 - QSA value kernel with 128 threads (12 heads split in two groups): bitwise
   (`qsa_pattn_parity` 468 cases, 0 differ) but -5.2% at 24K and -3.7% at 128K.
   It is issue-bound, not latency-bound; see `docs/prefill/qsa-value-reject.md`.
+- QK on DP4A (`STRATA_QSA_DP4A=1`, opt-in): the `qsa attn` phase is 4.3% slower and
+  128K prefill is -0.6%. DP4A shares the FP32 pipeline on Pascal, so int8xint8 does
+  not raise throughput; see `docs/prefill/qsa-dp4a.md`.
 
 ## Build
 
