@@ -253,7 +253,9 @@ __global__ void __launch_bounds__(THREADS, 2) ps_score_x_kernel(const float* __r
 // ps_value_d4_kernel: the value kernel with four dims a thread (64 threads, one CTA per (KV head, query)): a cell's four
 // codes are one 32-bit load (a warp reads 128 contiguous bytes), its 12 weights three broadcast float4 reads for 48
 // fmaf.  V loads run four cells ahead.  Per (dim, head) the fold and the merge are ps_value_kernel's.
-__global__ void __launch_bounds__(64) ps_value_d4_kernel(QsaAttnPools p, const int32_t* __restrict__ steps,
+// 64 threads and 151 registers held this kernel at 6 blocks an SM (18.75% occupancy).  minBlocks 8 caps the
+// registers at 128 (64 * 8 * 128 = 65,536) so eight CTAs fit: +33% warps for the same instruction stream.
+__global__ void __launch_bounds__(64, 8) ps_value_d4_kernel(QsaAttnPools p, const int32_t* __restrict__ steps,
                                                          const float* __restrict__ blocks, int n_kv_heads, int n_chunks,
                                                          float* __restrict__ attn) {
     constexpr int NT = 64;
