@@ -196,21 +196,20 @@ __device__ __forceinline__ void score_chunk_dp4a(const int8_t* q8, const float* 
                                                  int n_here, float scale, int t) {
     const int cell = t >> 2, g = t & 3;
     const bool live = cell < n_here && srow[cell] >= 0;
-    int4 ks4[4];
+    // 4 バイトの読みにそろえる: int4 (16 バイト) は 16 バイト境界を要求するが、この位置は
+    // g * 64 + 4 * j で 4 バイト間隔なので j=1 以降が 16 の倍数にならず misaligned address になる
+    int kv[16];
 #pragma unroll
-    for (int j = 0; j < 4; ++j) ks4[j] = *reinterpret_cast<const int4*>(&sk[cell][g * KV_Q8_GROUP + 4 * j]);
+    for (int j = 0; j < 16; ++j) kv[j] = *reinterpret_cast<const int*>(&sk[cell][g * KV_Q8_GROUP + 4 * j]);
     const float ksc = sks[cell][g];
 #pragma unroll
     for (int h = 0; h < G; ++h) {
         int s = 0;
         if (live) {
 #pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                const int4 qc = *reinterpret_cast<const int4*>(&q8[h * HD + g * KV_Q8_GROUP + 4 * j]);
-                s = STRATA_DP4A(ks4[j].x, qc.x, s);
-                s = STRATA_DP4A(ks4[j].y, qc.y, s);
-                s = STRATA_DP4A(ks4[j].z, qc.z, s);
-                s = STRATA_DP4A(ks4[j].w, qc.w, s);
+            for (int j = 0; j < 16; ++j) {
+                const int qc = *reinterpret_cast<const int*>(&q8[h * HD + g * KV_Q8_GROUP + 4 * j]);
+                s = STRATA_DP4A(kv[j], qc, s);
             }
         }
         float v = (float) s * (qs[h * NSC + g] * ksc);
