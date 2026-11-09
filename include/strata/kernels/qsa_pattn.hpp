@@ -18,6 +18,14 @@
 //
 // Off unless STRATA_PATTN_SM60=1, and compiled only in the CUDA build with STRATA_EXPERIMENTAL_SM60 (every other build
 // links stubs that answer false, so the usual attention runs).
+//
+// STRATA_QSA_DP4A=1 is an opt-in on top of that: ps_score_x_kernel's dot products run as int8 x int8 __dp4a instead of
+// float FMA.  The query is quantized to int8 with one scale per 64 dims (max|q| / 127), a cell's 64 dims per head are
+// one int32 from 16 __dp4a, and sum_g (int32_g * qs[g] * sks[g]) is added in float; K's int8 codes and scales are the
+// ones above, unchanged.  This variant is NOT bit for bit with qsa_decode_attn_batch (or with the path above): the
+// query's int8 quantization is error the float path does not have: 1/254 of a group's score in the worst case
+// (32 sks max|q| against 8128 sks max|q|), about 1e-3 of it in RMS.  Off (unset, the default): the kernels and the bytes
+// they write are exactly those described above.
 #pragma once
 
 #include "strata/kernels/qsa.hpp"

@@ -13,6 +13,7 @@
 // Only the default variant of the contributor's PR (#3943) is kept: ps_score_x_kernel + ps_value_d4_kernel.
 #include "strata/kernels/qsa_pattn.hpp"
 #include "strata/kernels/kv_q8.hpp"
+#include "strata/kernels/dp4a.hpp"
 #include "strata/core/geometry.hpp"
 
 #include <cuda_runtime.h>
@@ -62,6 +63,40 @@ constexpr int CHUNK = 64;
 constexpr int THREADS = 256;
 constexpr int WARPS = THREADS / 32;
 constexpr int NSC = HD / KV_Q8_GROUP;   // scales per row (4)
+// STRATA_QSA_DP4A's q codes (G heads x HD int8) and their per-64-dim scales (G x NSC floats)
+constexpr int Q8_CODES = G * HD;
+constexpr int Q8_SCALES = G * NSC;
+static_assert(G * HD / 4 % THREADS == 0, "quantize_q hands every thread a whole number of float4");
+static_assert(Q8_SCALES <= THREADS, "quantize_q takes one (head, group) a thread for the scales");
+
+// STRATA_QSA_DP4A: 0 off (default: the float score path, unchanged), 1 the score phase's dot products on int8 x int8
+// DP4A with the query quantized to int8 per 64 dims.  Read once (like pattn_mode), and a card without DP4A (sm_6.0)
+// or a build without the kernels keeps the float path.
+int qsa_dp4a_mode() {
+    static const int m = [] {
+        const char* v = std::getenv("STRATA_QSA_DP4A");
+        const int x = v != nullptr && *v != '\0' ? std::atoi(v) : 0;
+        if (x == 0) return 0;
+        int dev = 0, major = 0, minor = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess ||
+            cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
+            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess) {
+            cudaGetLastError();
+            std::fprintf(stderr, "strata pattn: STRATA_QSA_DP4A=1: the card could not be queried; "
+                                 "the float score path stays\n");
+            return 0;
+        }
+        if (major < 6 || (major == 6 && minor < 1)) {
+            std::fprintf(stderr, "strata pattn: STRATA_QSA_DP4A=1 needs DP4A (sm_6.1 or newer); this card has no "
+                                 "__dp4a, the float score path stays\n");
+            return 0;
+        }
+        std::fprintf(stderr, "strata pattn: STRATA_QSA_DP4A=1: the prompt score path on int8 x int8 DP4A (the query "
+                             "quantized per 64 dims, so not bit for bit with the float path)\n");
+        return 1;
+    }();
+    return m;
+}
 
 __device__ __forceinline__ float warp_sum_x(float v) {
     v += __shfl_xor_sync(0xffffffffu, v, 16); v += __shfl_xor_sync(0xffffffffu, v, 8);
@@ -110,6 +145,79 @@ __device__ __forceinline__ void stage_rows(const int8_t* __restrict__ codes, con
 #pragma unroll
     for (int j = 0; j < 4; ++j) reinterpret_cast<uint4*>(&sk[0][0])[t + THREADS * j] = kv[j];
     sks[t >> 2][t & 3] = sc;
+}
+
+// STRATA_QSA_DP4A: this CTA's KV head's queries (G heads of HD floats) to int8, one scale per 64 dims:
+//   qs = max|q| / 127,  code = round(q / qs) in -127 .. 127 (not -128, so both signs are symmetric like K's codes)
+// and an all-zero group gets qs = 0 with every code 0, which adds nothing to the score.  Phase 1 gives one (head,
+// group) to each of the first G * NSC threads (48 of 256) to take the 64 dims' max; phase 2 spreads the 3072
+// conversions over every thread, three float4 each (64 is a multiple of 4, so a float4 never straddles two scales).
+__device__ __forceinline__ int q8_of(float x, float r) {   // r = 1 / qs
+    return max(-127, min(127, __float2int_rn(x * r)));
+}
+__device__ __forceinline__ void quantize_q(const float* __restrict__ qh, int8_t* q8, float* qs, int t) {
+    if (t < Q8_SCALES) {
+        const float* const p = qh + (size_t) (t >> 2) * HD + (t & 3) * KV_Q8_GROUP;
+        float m = 0.0f;
+#pragma unroll
+        for (int j = 0; j < KV_Q8_GROUP / 4; ++j) {
+            const float4 v = __ldg(reinterpret_cast<const float4*>(p) + j);
+            m = fmaxf(m, fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w))));
+        }
+        qs[t] = m > 0.0f ? m * (1.0f / 127.0f) : 0.0f;   // t = head * NSC + group
+    }
+    __syncthreads();
+#pragma unroll
+    for (int j = 0; j < Q8_CODES / 4 / THREADS; ++j) {
+        const int idx = t + THREADS * j, d = (idx * 4) & (HD - 1), h = (idx * 4) / HD;
+        const float sc = qs[h * NSC + d / KV_Q8_GROUP];
+        uint32_t* const dst = reinterpret_cast<uint32_t*>(q8 + h * HD + d);
+        if (!(sc > 0.0f)) {   // an all-zero group: every code 0 (1 / 0 would be inf, and the group must not contribute)
+            *dst = 0u;
+            continue;
+        }
+        const float4 v = __ldg(reinterpret_cast<const float4*>(qh + (size_t) h * HD + d));
+        const float r = 1.0f / sc;
+        const uint32_t c0 = (uint32_t) (uint8_t) q8_of(v.x, r), c1 = (uint32_t) (uint8_t) q8_of(v.y, r);
+        const uint32_t c2 = (uint32_t) (uint8_t) q8_of(v.z, r), c3 = (uint32_t) (uint8_t) q8_of(v.w, r);
+        *dst = c0 | (c1 << 8) | (c2 << 16) | (c3 << 24);
+    }
+}
+
+// STRATA_QSA_DP4A's score phase: one (cell, 64-dim group) a thread (t = 4 cell + g).  The group's 64 K codes and 64 q
+// codes are 16 dwords each, 16 DP4A per head into an int32; the products are int8 x int8 and the sum of 64 of them is
+// below 2^24 (64 * 127 * 127 = 1,032,256), so that int32 and its (float) conversion are exact - the only new error is
+// the query's quantization.  Then sum_g (int32_g * qs[head][g] * sks[cell][g]) in float; the four threads of a cell are
+// adjacent, so that is two shfl_xor, a balanced tree over the groups in ascending order.
+// A masked / absent cell reads row 0's staged codes (as score_chunk_x does) and its column is -FLT_MAX, so the chunk
+// softmax sees exactly the cells the float path lets through.
+__device__ __forceinline__ void score_chunk_dp4a(const int8_t* q8, const float* qs, const int8_t (*sk)[HD],
+                                                 const float (*sks)[NSC], const long long* srow, float (*sp)[CHUNK],
+                                                 int n_here, float scale, int t) {
+    const int cell = t >> 2, g = t & 3;
+    const bool live = cell < n_here && srow[cell] >= 0;
+    int4 ks4[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) ks4[j] = *reinterpret_cast<const int4*>(&sk[cell][g * KV_Q8_GROUP + 4 * j]);
+    const float ksc = sks[cell][g];
+#pragma unroll
+    for (int h = 0; h < G; ++h) {
+        int s = 0;
+        if (live) {
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int4 qc = *reinterpret_cast<const int4*>(&q8[h * HD + g * KV_Q8_GROUP + 4 * j]);
+                s = STRATA_DP4A(ks4[j].x, qc.x, s);
+                s = STRATA_DP4A(ks4[j].y, qc.y, s);
+                s = STRATA_DP4A(ks4[j].z, qc.z, s);
+                s = STRATA_DP4A(ks4[j].w, qc.w, s);
+            }
+        }
+        float v = (float) s * (qs[h * NSC + g] * ksc);
+        v += __shfl_xor_sync(0xffffffffu, v, 1);
+        v += __shfl_xor_sync(0xffffffffu, v, 2);
+        if (g == 0) sp[h][cell] = live ? v * scale : -FLT_MAX;
+    }
 }
 
 constexpr int PS_BLK = G * CHUNK + 2 * CHUNK + 2 * G;   // floats per (query, KV head, chunk): e, rows (int64), m, l
@@ -203,7 +311,9 @@ __device__ __forceinline__ void score_chunk_x(const float4 (&qa)[G], const float
 }
 
 // ps_score_kernel with score_chunk_x (q loaded in the permuted slot order)
-template <int UNR>
+// DP4A: the same kernel with score_chunk_dp4a instead (STRATA_QSA_DP4A).  A separate instantiation rather than a
+// runtime branch, so the float instantiation above keeps the registers and the shared memory it has today.
+template <int UNR, bool DP4A = false>
 __global__ void __launch_bounds__(THREADS, 2) ps_score_x_kernel(const float* __restrict__ q, QsaAttnPools p,
                                                                 const int32_t* __restrict__ ids,
                                                                 const int32_t* __restrict__ step, int n_kv_heads,
@@ -218,6 +328,13 @@ __global__ void __launch_bounds__(THREADS, 2) ps_score_x_kernel(const float* __r
     __shared__ __align__(16) float sks[CHUNK][NSC];
     __shared__ float sp[G][CHUNK];
     __shared__ long long srow[CHUNK];
+    // STRATA_QSA_DP4A's q: G * HD int8 codes (3072 B) and G * NSC floats (192 B) = 3264 B, on top of sk 16384 B +
+    // sks 1024 B + sp 3072 B + srow 512 B = 20992 B, so 24256 B (23.7 KiB) of the 48 KiB a block may take statically;
+    // with __launch_bounds__(THREADS, 2) two of them are 48512 B of a P40's 96 KiB per SM, so the occupancy is what it
+    // was (2 blocks, held by launch_bounds, not by the 4 blocks the 20.5 KiB used to allow).  The float instantiation
+    // sizes both 1 and pays nothing.
+    __shared__ __align__(16) int8_t sq8[DP4A ? Q8_CODES : 1];
+    __shared__ float sqs[DP4A ? Q8_SCALES : 1];
     const int n_ids = __ldg(step + kStepWidth);
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
     const int c0 = chunk * CHUNK;
@@ -231,12 +348,20 @@ __global__ void __launch_bounds__(THREADS, 2) ps_score_x_kernel(const float* __r
         srow[t] = r;
         reinterpret_cast<long long*>(blk + G * CHUNK)[t] = r;
     }
-    float4 qa[G], qb[G];
-    load_q_perm(q + (size_t) (kvh * G) * HD, lane, qa, qb);
+    float4 qa[G], qb[G];   // the float path's q in registers; the DP4A instantiation quantizes q instead and drops these
+    if constexpr (DP4A) {
+        quantize_q(q + (size_t) (kvh * G) * HD, sq8, sqs, t);
+    } else {
+        load_q_perm(q + (size_t) (kvh * G) * HD, lane, qa, qb);
+    }
     __syncthreads();
     stage_rows(p.k_q, p.k_scale, srow, n_here, t, sk, sks);
     __syncthreads();
-    score_chunk_x<UNR>(qa, qb, sk, sks, srow, sp, n_here, scale, warp, lane);
+    if constexpr (DP4A) {
+        score_chunk_dp4a(sq8, sqs, sk, sks, srow, sp, n_here, scale, t);
+    } else {
+        score_chunk_x<UNR>(qa, qb, sk, sks, srow, sp, n_here, scale, warp, lane);
+    }
     __syncthreads();
     for (int h = warp; h < G; h += WARPS) {
         const float a = sp[h][lane], b = sp[h][lane + 32];
@@ -397,6 +522,13 @@ bool sm6x_device() {
     return cc[dev] == 6;
 }
 
+// one launch of the score phase: the float path (DP4A false, the default) or STRATA_QSA_DP4A's int8 x int8 one
+template <bool DP4A>
+void launch_score_x(const float* qb, const QsaAttnPools& p, const int32_t* ib, const int32_t* sb, int n_kv_heads,
+                    int page_size, float scale, float* blocks, int n_chunks, int cap, dim3 g1, cudaStream_t st) {
+    ps_score_x_kernel<1, DP4A><<<g1, THREADS, 0, st>>>(qb, p, ib, sb, n_kv_heads, page_size, scale, blocks, n_chunks, cap);
+}
+
 }  // namespace
 
 bool qsa_pattn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
@@ -416,6 +548,7 @@ bool qsa_pattn_batch_any_arch(const float* q, const QsaAttnPools& pools, const i
     const cudaStream_t st = (cudaStream_t) stream;
     const int n_chunks = (int) ((cap + CHUNK - 1) / CHUNK);
     const float scale = 1.0f / sqrtf((float) HD);
+    const int dp4a = qsa_dp4a_mode();   // STRATA_QSA_DP4A: 0 (default) keeps the float score path
     if (n_chunks > NCM) return false;   // a longer selection keeps the usual path
     // the scratch holds the blocks of one batch of queries (probabilities, rows, m and l of every chunk), evenly split
     const uint64_t per_q = (uint64_t) s.n_head_kv * (uint64_t) n_chunks * PS_BLK;
@@ -430,8 +563,13 @@ bool qsa_pattn_batch_any_arch(const float* q, const QsaAttnPools& pools, const i
         const float* qb = q + (size_t) t0 * s.n_head * HD;
         const int32_t* ib = ids + (size_t) t0 * cap;
         const int32_t* sb = steps + (size_t) t0 * kStepCount;
-        ps_score_x_kernel<1><<<g1, THREADS, 0, st>>>(qb, pools, ib, sb, (int) s.n_head_kv, (int) s.page_size, scale,
-                                                     scratch, n_chunks, (int) cap);
+        if (dp4a != 0) {
+            launch_score_x<true>(qb, pools, ib, sb, (int) s.n_head_kv, (int) s.page_size, scale, scratch, n_chunks,
+                                 (int) cap, g1, st);
+        } else {
+            launch_score_x<false>(qb, pools, ib, sb, (int) s.n_head_kv, (int) s.page_size, scale, scratch, n_chunks,
+                                  (int) cap, g1, st);
+        }
         ps_value_d4_kernel<<<g2, 64, 0, st>>>(pools, sb, scratch, (int) s.n_head_kv, n_chunks,
                                               attn + (size_t) t0 * s.n_head * HD);
     }
