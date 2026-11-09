@@ -159,6 +159,11 @@ function(strata_ggml_tq_overlay LLAMA OUT)
         set(_tq_fail "the DP4A MMQ config has no J=64 CASE for ${_ty}: the I tile 128 is not applied")
       endif()
     endforeach()
+    # IQ2_S / IQ2_XS: their Q8_0_16 tile is 51,200 B at I=128/J=64, over sm_61's 49,152 B, but 49,088 B at J=48.
+    # The J=48 row takes I=128 (16 rows a warp instead of 20); the J=64 row keeps I=64 as the fallback.
+    foreach(_ty IQ2_S IQ2_XS)
+      string(REPLACE "CASE(GGML_TYPE_${_ty}, 256, 2, 64,  48," "CASE(GGML_TYPE_${_ty}, 256, 2, 128,  48," _pd "${_pd}")
+    endforeach()
     file(WRITE "${_p}" "${_pd}")
   endif()
 
