@@ -15,10 +15,10 @@ configuration (`fork-v3`, engine 0.1.57) gives:
 
 | Metric | Before | After | Change |
 |---|---:|---:|---:|
-| prefill 24K (tok/s) | 485 | 630 | **+30%** |
-| prefill 128K (tok/s) | 434 | 625 | **+44%** |
-| TTFT 24K (s) | 57.9 | 39.5 | -32% |
-| TTFT 128K (s) | 278.0 | 215.1 | -23% |
+| prefill 24K (tok/s) | 485 | 671 | **+38%** |
+| prefill 128K (tok/s) | 434 | 684 | **+58%** |
+| TTFT 24K (s) | 57.9 | 36.8 | -36% |
+| TTFT 128K (s) | 278.0 | 200.8 | -28% |
 | TTFT 480K (s) | ~1,532 | 837.4 | **-45%** |
 | prefill 480K (tok/s) | ~303 | 561.6 | **+85%** |
 | decode 4K code / prose (tok/s) | 52.3 / 43.3 | 52.5 / 43.3 | no change |
@@ -32,17 +32,17 @@ base and final was within base-vs-base noise, with identical top-1 tokens.
 
 ```
 CONTEXT=512k
-STRATA_SET="ple-io=ram prefill=auto STRATA_DENSE_F32=1 \
-  rope-scaling=yarn rope-scale=2 \
+STRATA_SET="ple-io=ram prefill=32768 kv-resident=32768 draft-conf=0.7 \
+  STRATA_DENSE_F32=1 rope-scaling=yarn rope-scale=2 \
   STRATA_DENSE_MMQ=1 STRATA_MMQ_KQ=1 spec=4 \
-  STRATA_PATTN_SM60=1"
+  STRATA_PATTN_SM60=1 STRATA_SELECT_SIMT=1"
 ```
 
 Engine flags observed at startup:
 
 ```
 --max-context 524288 --kv int8 --kv-resident 32768
---ple-io ram --prefill auto --rope-scaling yarn --rope-scale 2
+--ple-io ram --prefill 32768 --rope-scaling yarn --rope-scale 2
 --spec 4 --draft dflash2 --draft-conf 0.7
 ```
 
@@ -60,6 +60,9 @@ cells stay in VRAM. RoPE scaling is YaRN with factor 2.
 | sm_61 bitwise default switch set | decode +2.5% | 10 existing switches, enabled by architecture |
 | Router/publish and wait/copy fusion | 97 fewer graph nodes per token | Bitwise; no measurable speed change |
 | `STRATA_PATTN_SM60=1` | prefill +6.6 to +7.1% | Bitwise against the prompt attention path; needle/QA unchanged |
+| prompt chunk 32768 (was 8192) | prefill +6.6%, TTFT 128K -9% | Env only; weights are re-read and re-dequantized once per chunk |
+| `STRATA_SELECT_SIMT=1` | prefill +1.7% at 128K | Different summation order in the block selector; needle/QA unchanged |
+| hc down+inject share one bf16->fp32 conversion | ~1% (inside the combined result) | Bitwise; `gemm_bf16_parity` 0 failures |
 
 ## Changes that were rejected
 
@@ -73,8 +76,12 @@ cells stay in VRAM. RoPE scaling is YaRN with factor 2.
 - chunk 4096 (-6%), PF_W16 cache (structurally no-op at 512K because VRAM is full),
   KV `q4_0`, `spec` 3/5, `mtp-draft-vocab`, `STRATA_PTC` options that are unavailable
   on sm_61 (PDL, L2 persistence, `cp.async`, tensor cores).
-- `chunk 16384` (+3%) and `STRATA_SELECT_SIMT=1` (+1.5%) remain conditional: the first
-  is not bitwise and changes the launcher's `--draft-conf`; the second is below 5%.
+- Raising the prompt chunk from 8192 to 32768 was kept (prefill +6.6%, TTFT 128K -9%),
+  but it is not bitwise and it changes the launcher's `--draft-conf`, so both
+  `prefill=32768` and `draft-conf=0.7` are set explicitly.
+- QSA value kernel with 128 threads (12 heads split in two groups): bitwise
+  (`qsa_pattn_parity` 468 cases, 0 differ) but -5.2% at 24K and -3.7% at 128K.
+  It is issue-bound, not latency-bound; see `docs/prefill/qsa-value-reject.md`.
 
 ## Build
 
