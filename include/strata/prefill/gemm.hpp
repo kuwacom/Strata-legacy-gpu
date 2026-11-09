@@ -63,6 +63,17 @@ public:
     bool bf16_narrow(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,
                      void* stream = nullptr);
 
+    /// down と inject を 1 つのカーネルで (STRATA_HC_DOWN_BF16=2): Y1[T, N1] = X . W1^T と Y2[T, N2] = X . W2^T を
+    /// X の読み 1 回で出す。hyper-connection read の down (N1 320) と inject (N2 4) は同じ xn16 を読むので、
+    /// bf16_narrow を 2 回呼ぶと T x K の BF16 を 2 回読むことになる。down のタイルの形 (BM 64 / BK 32 /
+    /// 1 スレッド 4 行 x 4 列 / k を 32 ずつ昇順) は bf16_narrow と同じなので、各出力の K 方向の和の順序も
+    /// 同じ: 2 回呼んだのと同じ値になる。inject (N2 <= 4) は 1 スレッド 1 行 x 1 列 (64 行 x 4 列 = 256 出力を
+    /// 256 スレッドに 1 つずつ) で、これも k 昇順に 1 FMA/k。条件は bf16_narrow と同じに N2 <= 4 を足したもので、
+    /// 満たさなければ何も書かずに false (呼び出し側は 2 回の bf16_narrow に落ちる)。beta 0 のみ、ldy1 == N1、
+    /// ldy2 == N2、X / W は BF16。Y2 を書くのは列タイル 1 つ (blockIdx.x == 0) のブロックだけ。
+    bool bf16_narrow2(const uint16_t* X, const uint16_t* W1, const uint16_t* W2, float* Y1, float* Y2, int64_t T,
+                      int64_t N1, int64_t N2, int64_t K, int64_t ldy1 = 0, int64_t ldy2 = 0, void* stream = nullptr);
+
     /// S (STRATA_HCD_EXACT): the HC down projection (N 320, K 10240) by the WMMA kernel that reproduces hipBLASLt's
     /// solution 1176 / 1177 bit for bit; false (nothing launched) unless hipBLASLt would take one of those for this
     /// shape (so the caller falls back to bf16(), with the same ldx).

@@ -572,8 +572,16 @@ inline bool hc_pad() { return pf_hcdown() || hcd_exact(); }
 // kernel that reads the activations where they are (Pascal's bf16() widens them to T x K FP32 values, 335 MB at
 // T = 8192, and reads them back: 2.2 ms of the 10.1 ms a read takes).
 // 累積の順序が cuBLAS と変わるので bitwise ではない。bf16_pair とも排他 (下の hc read を参照)
-inline bool hc_down_bf16() {
-    static const bool v = [] { const char* e = std::getenv("STRATA_HC_DOWN_BF16"); return e != nullptr && e[0] == '1'; }();
+// STRATA_HC_DOWN_BF16=2: down と inject を 1 つのカーネル (Gemm::bf16_narrow2) で出し、xn16 の読みを 1 回にする。
+// 1 は今までの 2 回呼び (down と inject がそれぞれ bf16_narrow)、未設定 (0) は従来の bf16_pair / bf16_proj
+inline int hc_down_bf16() {   // 0 = 使わない, 1 = 2 回の bf16_narrow, 2 = bf16_narrow2 を 1 回
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_HC_DOWN_BF16");
+        if (e == nullptr) return 0;
+        if (e[0] == '2') return 2;
+        if (e[0] == '1') return 1;
+        return 0;
+    }();
     return v;
 }
 // STRATA_QSA_FUSE_NR (default on, =0 runs rms_rows + rope [+ split_q] as separate kernels): the QSA layer's K, query and
@@ -4075,15 +4083,27 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 // 条件を満たさない (Pascal でない、ldx が詰まっていない、など) ときは false が返るので、以降は
                 // 今までどおり bf16_pair / bf16_proj に落ちる
                 bool hcnarrow = false;
-                if (!hcd && !hdown && hc_down_bf16() && !xf16 && m.xn16_lo == nullptr && ldx == D &&
+                bool hcnarrow2 = false;   // down と inject を 1 つのカーネルで出した (STRATA_HC_DOWN_BF16=2)
+                if (!hcd && !hdown && hc_down_bf16() != 0 && !xf16 && m.xn16_lo == nullptr && ldx == D &&
                     wd->q8_scale == nullptr && wd->kind == core::WeightKind::Bf16InF32 && wd->data != nullptr &&
                     wd->ne0 == D && wd->ne1 == LR) {
                     const bool ct = g_cold.begin();
-                    hcnarrow = m.gemm.bf16_narrow(m.xn16, (const uint16_t*) wd->data, m.lo, T, LR, D, 0, m.cs);
-                    if (ct && hcnarrow) g_cold.end("bf16_narrow", sd, T, LR, D);
+                    // =2: inject も同じ xn16 を読むので、1 つのカーネルで両方の Y を出す (X の読みが 1 回になる)。
+                    // 条件は下の inject の narrow と同じ (wi が BF16 のまま、ne0 == D、ne1 == HC) で、
+                    // bf16_narrow2 が受け付けなければ =1 と同じ 2 回呼びに落ちる
+                    if (hc_down_bf16() >= 2 && wi->q8_scale == nullptr && wi->kind == core::WeightKind::Bf16InF32 &&
+                        wi->data != nullptr && wi->ne0 == D && wi->ne1 == HC) {
+                        hcnarrow2 = m.gemm.bf16_narrow2(m.xn16, (const uint16_t*) wd->data, (const uint16_t*) wi->data,
+                                                        m.lo, m.inj, T, LR, HC, D, 0, 0, m.cs);
+                        if (ct && hcnarrow2) g_cold.end("bf16_narrow2", sd + "+" + si, T, LR + HC, D);
+                    }
+                    if (!hcnarrow2) {
+                        hcnarrow = m.gemm.bf16_narrow(m.xn16, (const uint16_t*) wd->data, m.lo, T, LR, D, 0, m.cs);
+                        if (ct && hcnarrow) g_cold.end("bf16_narrow", sd, T, LR, D);
+                    }
                 }
                 bool hcpair = false;
-                if (!hcd && !hdown && !hcnarrow && !xf16 && m.xn16_lo == nullptr && wd->q8_scale == nullptr && wi->q8_scale == nullptr &&
+                if (!hcd && !hdown && !hcnarrow && !hcnarrow2 && !xf16 && m.xn16_lo == nullptr && wd->q8_scale == nullptr && wi->q8_scale == nullptr &&
                     wd->kind == core::WeightKind::Bf16InF32 && wi->kind == core::WeightKind::Bf16InF32 && wd->data &&
                     wi->data && wd->ne0 == D && wd->ne0 == wi->ne0 && wd->ne1 > 0 && wi->ne1 > 0) {
                     const bool ct = g_cold.begin();
@@ -4091,7 +4111,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                               T, wd->ne1, wi->ne1, wd->ne0, 0, 0, ldx != D ? ldx : 0);
                     if (ct && hcpair) g_cold.end("bf16_pair", sd + "+" + si, T, wd->ne1 + wi->ne1, wd->ne0);
                 }
-                if (!hcnarrow && !hcpair && !hcd && !hdown &&
+                if (!hcnarrow && !hcnarrow2 && !hcpair && !hcd && !hdown &&
                     !bf16_proj(m.gemm, wd, m.xn16, m.lo, T, sd, err, 0, m.xn16_lo, ldx != D ? ldx : 0, m.cs, xf16))
                     return false;
                 gr_silu(m.lo, m.lo16, T, m.cs, m.lo16_lo);
@@ -4134,7 +4154,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     hinj_narrow = m.gemm.bf16_narrow(m.xn16, (const uint16_t*) wi->data, m.inj, T, HC, D, 0, m.cs);
                     if (ct && hinj_narrow) g_cold.end("bf16_narrow", si, T, HC, D);
                 }
-                if (!hinj_narrow && !hcpair && !hcd && !bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err, 0, m.xn16_lo, ldx != D ? ldx : 0, m.cs, xf16)) return false;
+                // =2 では down のカーネルが inject も書いている (hcnarrow2) ので、ここでは何も走らせない
+                if (!hcnarrow2 && !hinj_narrow && !hcpair && !hcd && !bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err, 0, m.xn16_lo, ldx != D ? ldx : 0, m.cs, xf16)) return false;
                 pt.mark(kPfHcMix, cs);
                 if (upmixed) {
                 } else if (gr_unfused()) {
