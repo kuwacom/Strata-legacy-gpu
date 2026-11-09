@@ -15,10 +15,10 @@ configuration (`fork-v3`, engine 0.1.57) gives:
 
 | Metric | Before | After | Change |
 |---|---:|---:|---:|
-| prefill 24K (tok/s) | 485 | 671 | **+38%** |
-| prefill 128K (tok/s) | 434 | 684 | **+58%** |
-| TTFT 24K (s) | 57.9 | 36.8 | -36% |
-| TTFT 128K (s) | 278.0 | 200.8 | -28% |
+| prefill 24K (tok/s) | 485 | 682 | **+41%** |
+| prefill 128K (tok/s) | 434 | 695 | **+60%** |
+| TTFT 24K (s) | 57.9 | 36.2 | -37% |
+| TTFT 128K (s) | 278.0 | 197.8 | -29% |
 | TTFT 480K (s) | ~1,532 | 837.4 | **-45%** |
 | prefill 480K (tok/s) | ~303 | 561.6 | **+85%** |
 | decode 4K code / prose (tok/s) | 52.3 / 43.3 | 52.5 / 43.3 | no change |
@@ -35,7 +35,7 @@ CONTEXT=512k
 STRATA_SET="ple-io=ram prefill=32768 kv-resident=32768 draft-conf=0.7 \
   STRATA_DENSE_F32=1 rope-scaling=yarn rope-scale=2 \
   STRATA_DENSE_MMQ=1 STRATA_MMQ_KQ=1 spec=4 \
-  STRATA_PATTN_SM60=1 STRATA_SELECT_SIMT=1"
+  STRATA_PATTN_SM60=1 STRATA_SELECT_SIMT=1 STRATA_HC_DOWN_BF16=1"
 ```
 
 Engine flags observed at startup:
@@ -63,6 +63,7 @@ cells stay in VRAM. RoPE scaling is YaRN with factor 2.
 | prompt chunk 32768 (was 8192) | prefill +6.6%, TTFT 128K -9% | Env only; weights are re-read and re-dequantized once per chunk |
 | `STRATA_SELECT_SIMT=1` | prefill +1.7% at 128K | Different summation order in the block selector; needle/QA unchanged |
 | hc down+inject share one bf16->fp32 conversion | ~1% (inside the combined result) | Bitwise; `gemm_bf16_parity` 0 failures |
+| `STRATA_HC_DOWN_BF16=1` (narrow BF16 kernel for hc down/inject) | 128K prefill +1.4%; the hc pair -18% | Not bitwise (K summation order, rel RMS ~3.5e-6); needle/QA passed |
 
 ## Changes that were rejected
 
