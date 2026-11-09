@@ -4125,7 +4125,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 }
                 if (!upmixed && !bf16_proj(m.gemm, wu, m.lo16, m.gated, T, su, err, 0, m.lo16_lo, 0, m.cs)) return false;
                 pt.mark(kPfHcInj, cs);
-                if (!hcpair && !hcd && !bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err, 0, m.xn16_lo, ldx != D ? ldx : 0, m.cs, xf16)) return false;
+                // inject も同じ xn16 を読む狭い射影 (N = HC = 4) なので、down を narrow で行ったときは
+                // こちらも BF16 のまま読む。従来は FP32 の活性像 (T x K x 4 バイト) を読み直していた
+                bool hinj_narrow = false;
+                if (hcnarrow && !xf16 && m.xn16_lo == nullptr && ldx == D && wi->q8_scale == nullptr &&
+                    wi->kind == core::WeightKind::Bf16InF32 && wi->data != nullptr && wi->ne0 == D && wi->ne1 == HC) {
+                    const bool ct = g_cold.begin();
+                    hinj_narrow = m.gemm.bf16_narrow(m.xn16, (const uint16_t*) wi->data, m.inj, T, HC, D, 0, m.cs);
+                    if (ct && hinj_narrow) g_cold.end("bf16_narrow", si, T, HC, D);
+                }
+                if (!hinj_narrow && !hcpair && !hcd && !bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err, 0, m.xn16_lo, ldx != D ? ldx : 0, m.cs, xf16)) return false;
                 pt.mark(kPfHcMix, cs);
                 if (upmixed) {
                 } else if (gr_unfused()) {
