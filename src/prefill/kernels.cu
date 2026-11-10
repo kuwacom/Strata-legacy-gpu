@@ -185,9 +185,13 @@ __global__ void __launch_bounds__(256) gr_write_norm_rs_kernel(float* __restrict
     const float sc = 2.0f * sigm(inj[t * inj_ld + c] / (float) HC);
     float v[GRW_PER];
     float ss = 0.0f;
-    int k = 0;
+    // k is counted, not a side effect of d: with d starting at threadIdx.x ptxas cannot see the trip count as a
+    // constant, so v[k] keeps a runtime index and the array lives in local memory (STACK 40, one LDL and one STL
+    // per element - 81,920 B of local traffic per token and half).  Counting k makes the index constant after
+    // unrolling and v stays in registers.  d still runs in ascending order, so the bits are the same
 #pragma unroll
-    for (int d = threadIdx.x; d < N; d += 256, ++k) {
+    for (int k = 0; k < GRW_PER; ++k) {
+        const int d = (int) threadIdx.x + k * 256;
         const float x = fmaf(bo[t * N + d], sc, r[d]);
         r[d] = x;
         v[k] = x;
@@ -195,9 +199,9 @@ __global__ void __launch_bounds__(256) gr_write_norm_rs_kernel(float* __restrict
     }
     const float rs = rsqrtf(block_sum(ss, sh) / (float) N + eps);
     if (threadIdx.x == 0) rs_out[row] = rs;
-    k = 0;
 #pragma unroll
-    for (int d = threadIdx.x; d < N; d += 256, ++k) {
+    for (int k = 0; k < GRW_PER; ++k) {
+        const int d = (int) threadIdx.x + k * 256;
         const float x = v[k] * rs * w[c * N + d];
         const uint16_t h = act16(x);
         xn16[xo + d] = f16img ? bf_to_hf_conv(h) : h;
@@ -224,9 +228,10 @@ __global__ void __launch_bounds__(256) gr_write_cvec_norm_rs_kernel(
     const bool steer = *on != 0 && s != 0.0f;
     float x[GRW_PER];
     float dot = 0.0f;
-    int k = 0;
+    // counted k, as in gr_write_norm_rs_kernel: the index has to be constant for x[] to stay in registers
 #pragma unroll
-    for (int d = threadIdx.x; d < N; d += 256, ++k) {
+    for (int k = 0; k < GRW_PER; ++k) {
+        const int d = (int) threadIdx.x + k * 256;
         const float xv = fmaf(bo[t * N + d], sc, r[d]);
         x[k] = xv;
         if (steer && mode == 0) dot = fmaf(xv, v_l[d], dot);
@@ -246,9 +251,9 @@ __global__ void __launch_bounds__(256) gr_write_cvec_norm_rs_kernel(
         dot = part[0] * s;
     }
     float ss = 0.0f;
-    k = 0;
 #pragma unroll
-    for (int d = threadIdx.x; d < N; d += 256, ++k) {
+    for (int k = 0; k < GRW_PER; ++k) {
+        const int d = (int) threadIdx.x + k * 256;
         float xv = x[k];
         if (steer) xv = mode == 0 ? fmaf(-dot, v_l[d], xv) : xv + v_l[d];
         r[d] = xv;
@@ -257,9 +262,9 @@ __global__ void __launch_bounds__(256) gr_write_cvec_norm_rs_kernel(
     }
     const float rs = rsqrtf(block_sum(ss, sh) / (float) N + eps);
     if (threadIdx.x == 0) rs_out[row] = rs;
-    k = 0;
 #pragma unroll
-    for (int d = threadIdx.x; d < N; d += 256, ++k) {
+    for (int k = 0; k < GRW_PER; ++k) {
+        const int d = (int) threadIdx.x + k * 256;
         const float y = x[k] * rs * w[c * N + d];
         const uint16_t h = act16(y);
         xn16[t * ldx + (int64_t) c * N + d] = f16img ? bf_to_hf_conv(h) : h;
