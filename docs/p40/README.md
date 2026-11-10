@@ -11,22 +11,27 @@ The 5% threshold is used for adoption unless a change is bitwise and reproducibl
 ## Result
 
 Compared with the previous production image (`0.2.7`, engine 0.1.52), the final
-configuration (`fork-v3`, engine 0.1.57) gives:
+configuration (`fork-v7`, engine 0.1.57) gives:
 
 | Metric | Before | After | Change |
 |---|---:|---:|---:|
-| prefill 24K (tok/s) | 485 | 692 | **+43%** |
-| prefill 128K (tok/s) | 434 | 705 | **+62%** |
-| TTFT 24K (s) | 57.9 | 35.7 | -38% |
-| TTFT 128K (s) | 278.0 | 194.7 | -30% |
-| TTFT 480K (s) | ~1,532 | 837.4 | **-45%** |
-| prefill 480K (tok/s) | ~303 | 561.6 | **+85%** |
-| decode 4K code / prose (tok/s) | 52.3 / 43.3 | 52.5 / 43.3 | no change |
-| decode 24K code / prose (tok/s) | 50.3 / 43.6 | 51.9 / 44.5 | noise |
+| prefill 24K (tok/s) | 485 | 732 | **+51%** |
+| prefill 128K (tok/s) | 434 | 740 | **+71%** |
+| TTFT 24K (s) | 57.9 | 33.7 | **-42%** |
+| TTFT 128K (s) | 278.0 | 185.5 | **-33%** |
+| TTFT 480K (s) | ~1,532 | 837.4 (fork-v3) | **-45%** |
+| prefill 480K (tok/s) | ~303 | 561.6 (fork-v3) | **+85%** |
+| decode 4K code / prose (tok/s) | 52.3 / 43.3 | 44.1-51.9 / 41.3-43.4 | no change |
+| decode 24K code / prose (tok/s) | 50.3 / 43.6 | 49.3-52.4 / 41.6-43.4 | no change |
 
-Quality checks at 512K: needle retrieval at 32K/128K/480K (50% and 90%) was correct;
-an 8-question 128K extraction set scored 8/8 with byte-identical answers; KL between
-base and final was within base-vs-base noise, with identical top-1 tokens.
+The 480K rows were measured on `fork-v3` and have not been re-run since; `fork-v7` is
+about 5% faster than `fork-v6` at 128K, which should carry to 480K.
+
+Quality checks at 512K: needle retrieval at 24K/32K/128K (50%) and at 32K/128K/480K
+(50% and 90%, `fork-v3`) was correct; an 8-question 128K extraction set scored 8/8;
+`gemm_f32_parity` (5,201 sizes) is bitwise, `gemm_bf16_parity` 0 failures,
+`qsa_pattn_parity` 468 cases 0 differ and `prefill_swiglu_quant_test` ok on `fork-v7`.
+KL between base and final was within base-vs-base noise, with identical top-1 tokens.
 
 ## Production configuration
 
@@ -65,6 +70,10 @@ cells stay in VRAM. RoPE scaling is YaRN with factor 2.
 | hc down+inject share one bf16->fp32 conversion | ~1% (inside the combined result) | Bitwise; `gemm_bf16_parity` 0 failures |
 | `STRATA_HC_DOWN_BF16=1` (narrow BF16 kernel for hc down/inject) | 128K prefill +1.4%; the hc pair -18% | Not bitwise (K summation order, rel RMS ~3.5e-6); needle/QA passed |
 | `__launch_bounds__(64, 8)` on the QSA value kernel | 128K prefill +1.45%; `qsa attn` -10.9% | Bitwise; 151->128 registers, 6->8 CTAs an SM (`qsa_pattn_parity` 468 cases) |
+| Counted loop for the hyper-connection write-back (`v[]` was in local memory) | `hc write` 8,709 -> 5,099 ms (-41%); 128K prefill +1.8% | Bitwise; 81,920 B of local traffic per token and half removed (SASS STACK 40 -> 0) |
+| Dense MMQ activations quantized straight from FP16 | 128K prefill +1.3%; `gdn out proj` -7.6%, `router+shared` -10.3% | Bitwise; removes an f16->f32->q8_1 round trip of T x K per launch |
+| Shared expert down projection (K=640) through dense MMQ | `router+shared` -15.1%; 128K prefill +1.2% | Not bitwise (activations rounded to int8); needle 24K/32K/128K and QA 8/8 passed |
+| `STRATA_MMQ_SQ=1` (SwiGLU and the down product's q8_1 in one pass) | `gemm gate/up` -4.2%; 128K prefill +0.7% | `prefill_swiglu_quant_test` ok |
 
 ## Changes that were rejected
 
