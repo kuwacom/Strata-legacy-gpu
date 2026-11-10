@@ -653,6 +653,7 @@ Gemm::~Gemm() {
 #if defined(STRATA_PREFILL_MMQ)
     delete static_cast<strata::prefill::mmq::Context*>(mmq_ctx_);
     if (mmq_buf_) cudaFree(mmq_buf_);
+    if (mmq_w_) cudaFree(mmq_w_);
 #endif
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
     delete static_cast<HipLtState*>(hipblaslt_state_);
@@ -1450,7 +1451,10 @@ bool Gemm::native_mmq(const uint16_t* X, int type, const void* W, float* Y, int6
     // because its gather buffers carry a zeroed tail; a dense tensor is passed as-is, so a K that
     // is not a full chunk multiple (e.g. the 640-value shared-expert down: 20 blocks of 32) stays on
     // the dequantize + cuBLAS path.
-    if (K > kMaxK || K % 256 != 0) return false;
+    // (2026-11-10 実測) 上の但し書きの 640 値の形も載るようになった: 読み越しは活性の詰め物 (pad512 の、量子化が
+    // スケール 0 を書く領域) とだけ掛かるので、mmq::k_in_padding が成り立つ K は重みを末尾 256 B のゼロ付きの控えに
+    // 移して MMQ に渡す。128K の実測は ~/work/results/dense (candidate (a))
+    if (K > kMaxK || (K % 256 != 0 && !mmq::k_in_padding(type, K))) return false;
     int64_t R = scratch_elems_ / (2 * K);   // FP32 activations for a chunk fit in the FP16 dequant scratch
     if (R > kRows) R = kRows;
     if (R > T) R = T;
@@ -1470,6 +1474,31 @@ bool Gemm::native_mmq(const uint16_t* X, int type, const void* W, float* Y, int6
         mmq::iota((int32_t*) ((uint8_t*) mmq_buf_ + ident_off), kRows, stream_);
         std::fprintf(stderr, "prefill gemm: dense MMQ on (STRATA_DENSE_MMQ=1)\n");
     }
+    // K がタイルの倍数でない形 (shared expert の down、K=640 = 2.5 タイル) は、行列の末尾の先を読まないよう
+    // 控えに移す。1 枚を再利用し、1024 token ずつの起動ごとに 1 MB 弱をコピーする (数 us)
+    const void* Wblk = W;
+    if (K % 256 != 0) {
+        const int64_t bytes = (int64_t) mmq::matrix_bytes(type, N, K);
+        if (mmq_w_cap_ < bytes + 256) {
+            (void) cudaStreamSynchronize((cudaStream_t) stream_);   // 前の起動がまだ読んでいる
+            if (mmq_w_) (void) cudaFree(mmq_w_);
+            mmq_w_ = nullptr;
+            mmq_w_cap_ = 0;
+            if (cudaMalloc(&mmq_w_, (size_t) bytes + 256) != cudaSuccess ||
+                cudaMemset((uint8_t*) mmq_w_ + bytes, 0, 256) != cudaSuccess) {
+                cudaGetLastError();
+                if (mmq_w_) (void) cudaFree(mmq_w_);
+                mmq_w_ = nullptr;
+                return false;
+            }
+            mmq_w_cap_ = bytes + 256;
+        }
+        if (cudaMemcpyAsync(mmq_w_, W, (size_t) bytes, cudaMemcpyDeviceToDevice, (cudaStream_t) stream_) != cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+        Wblk = mmq_w_;
+    }
     void* xq = mmq_buf_;
     const int32_t* ident = (const int32_t*) ((uint8_t*) mmq_buf_ + ident_off);
     int32_t* bounds = (int32_t*) ((uint8_t*) mmq_buf_ + bounds_off);
@@ -1485,7 +1514,7 @@ bool Gemm::native_mmq(const uint16_t* X, int type, const void* W, float* Y, int6
         }
         mmq::set_bounds(bounds, (int32_t) rows, stream_);
         mmq::Product p;
-        p.w = W;
+        p.w = Wblk;
         p.type = type;
         p.w_rows = N;
         p.w_cols = K;

@@ -708,6 +708,17 @@ size_t overread_bytes(int t, int64_t cols) {
     return (size_t) blocks * type_bytes((int) t);
 }
 
+bool k_in_padding(int t, int64_t cols) {
+    if (!supported(t) || cols <= 0) return false;
+    const int64_t qk = type_blck((int) t);
+    if (qk <= 0 || cols % qk != 0) return false;   // K/qk の切り捨てで末尾の半端なブロックが落ちる形は不可
+    const size_t ob = overread_bytes(t, cols);
+    if (ob == 0) return true;
+    // 読み越しは「次の行の頭」と「行列の末尾の先」を読むだけで、積は活性の詰め物 (pad512) のゼロスケールと掛かる
+    const int64_t over = (int64_t) (ob / type_bytes((int) t)) * qk;
+    return cols + over <= pad512(cols);
+}
+
 bool whole_tiles(int t, int64_t w_rows, int n_experts) {
     if (!supported(t) || w_rows % 128 != 0 || n_experts <= 0) return false;
     // launch_mul_mat_q's grid: without stream-k one block per tile; with it one block per tile when the tiles fill

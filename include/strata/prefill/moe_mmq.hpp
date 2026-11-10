@@ -155,6 +155,11 @@ bool tab_fits(int ggml_type, int64_t w_rows);
 /// The bytes past a [rows, cols] matrix that its last row's final K tile reads (the largest over-read of any
 /// config on any visible GPU): 72 for IQ4_NL and 136 for Q8_0 at 640 columns, 0 for IQ3_S at 2560 (sm_86).  0 without MMQ.
 size_t overread_bytes(int ggml_type, int64_t cols);
+/// Whether MMQ may multiply a dense [*, cols] weight of this type whose K is not a whole 256-value K tile: the
+/// type's blocks must divide `cols`, and the last K tile's over-read must stay inside the activation row's 512-value
+/// padding, whose scale quantize.cu leaves zero - the over-read's products are then zero and only the weight's own
+/// bytes matter (the caller still guards the read past the matrix's last row). See Gemm::native_mmq.
+bool k_in_padding(int ggml_type, int64_t cols);
 /// The room kept after each sized expert slot's blob for that over-read (the guard).
 constexpr size_t kSlotGuard = 256;
 /// Every launch of `n_experts` experts of [w_rows, *] `ggml_type` weights computes each output tile in one block

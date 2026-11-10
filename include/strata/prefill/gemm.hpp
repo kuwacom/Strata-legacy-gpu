@@ -162,6 +162,9 @@ private:
     void* mmq_ctx_ = nullptr;
     void* mmq_buf_ = nullptr;
     bool mmq_failed_ = false;
+    // K が MMQ の K タイルの倍数でない重みの控え (matrix_bytes + 256 B のゼロ)。末尾の行の読み越しが行列の外へ出ないため
+    void* mmq_w_ = nullptr;
+    int64_t mmq_w_cap_ = 0;
     /// Y = X . W^T with FP16 out, written into Y's own rows and widened there (no buffer): prompt_f16() only.
     void f16_inplace(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy);
 };
