@@ -1424,6 +1424,35 @@ uint64_t qsa_set_bytes(size_t T, int64_t cap, int64_t max_blocks, int64_t sel_ba
 // is converted to GGUF Q2_0 blocks on the gather), whether any layer keeps the FP16 path (IQ1_M), and the largest
 // gate/up and down matrices a group buffer slot holds.  STRATA_PREFILL_MMQ=0: the FP16 path everywhere (the A/B).
 constexpr int MMQ_GROUP = 16;                  // experts per MMQ launch (the gather is per expert, as blobs arrive)
+// STRATA_MMQ_JWIDE=<J>: the gate/up product's tile choice optimizes against this column count instead of the group's
+// longest expert (llama.cpp's ncols_opt).  A narrower J buys a taller I on sm_61: IQ2_XS/IQ2_XXS hold an I=128 tile
+// only up to J=48 (49,088 B of the 49,152), so at J=48 the group reads its activations nty/2 times.  The grid still
+// covers every row.  0 (default): max_rows, exactly as before.
+int mmq_jwide() {
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_MMQ_JWIDE");
+        return e != nullptr ? std::atoi(e) : 0;
+    }();
+    return v;
+}
+// STRATA_MMQ_SQ=1: the MMQ gate/up group's SwiGLU and the down product's q8_1 rows in one pass (mmq::swiglu_quant),
+// as the weight-stationary path already does - the FP32 H between them is never written or read.
+// STRATA_MMQ_GU=1: the gate/up product's SwiGLU in its write-back (mmq::gu), the group's [rows, 2 n_ff] output and
+// the pass over it gone.  Off by default: the fused launch is only taken where mmq::gu covers the type and shape.
+bool mmq_gu() {
+    static const bool on = [] {
+        const char* e = std::getenv("STRATA_MMQ_GU");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+    return on;
+}
+bool mmq_swiglu_quant() {
+    static const bool on = [] {
+        const char* e = std::getenv("STRATA_MMQ_SQ");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+    return on;
+}
 // MMQ reads up to one 256-value tile past a matrix's last row when the row length is not a multiple of it (the down
 // product: 640 values).  Those bytes meet zero activations, which is harmless only if they decode to finite numbers -
 // llama.cpp zero-pads after every tensor, and so does a group buffer: this many zeroed bytes follow its last expert.
@@ -5801,8 +5830,31 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 gu.n = ngx; gu.xq = m.Xq; gu.bounds = m.bounds_dev + j0; gu.ids = m.ids_identity;
                                 gu.total_rows = T * K; gu.max_rows = maxr; gu.dst = m.GU; gu.ld_dst = 1280;
                                 gu.y_scale = mmq::fp4_activations(mmq_gt) ? m.Xscale : nullptr;
+                                gu.j_opt = mmq_jwide();
                                 if (direct) gu.tab = &tgu;
+                                // STRATA_MMQ_GU=1: SwiGLU inside the gate/up product's write-back, so the group's
+                                // [rows, 2 n_ff] output is never stored: it writes H itself (ld 640).  The two
+                                // readers that need an FP32 H after the product (an expert's NVFP4 gate/up scales,
+                                // the APR rotation) keep the three-pass sequence.
+                                const bool gu_fused = mmq_gu() && !direct && !had_d && !mmq::fp4_activations(mmq_gt) &&
+                                                      !(lay.native && lay.fmt[(size_t) l].tail_off);
+                                mmq::Product gu_h = gu;
+                                gu_h.dst = m.H; gu_h.ld_dst = 640;
+                                if (gu_fused && mmq::gu(gu_h, m.cs)) {
+                                    // H is ready: only the down product's q8_1 rows remain
+                                    mmq::quantize(m.H + r0 * 640, nullptr, m.Hq, mmq_dt, 640, 640, nr, m.cs, m.Hscale);
+                                } else {
                                 m.mmq_ctx->run(gu, m.cs);
+                                // the down product's q8_1 rows taken straight off the gate/up output: the FP32 H
+                                // in between exists only for the two readers that need it (an expert's NVFP4
+                                // gate/up scales, and the APR rotation), and mmq::swiglu_quant is the same
+                                // arithmetic as swiglu followed by quantize (tests/cuda/prefill_swiglu_quant_test)
+                                const bool sq = mmq_swiglu_quant() && !had_d && !mmq::fp4_activations(mmq_dt) &&
+                                                !(lay.native && lay.fmt[(size_t) l].tail_off) &&
+                                                mmq::swiglu_quant_ok(mmq_dt);
+                                if (sq) {
+                                    mmq::swiglu_quant(m.GU + r0 * 1280, m.Hq, nr, !lay.native, m.cs);
+                                } else {
                                 if (lay.native && lay.fmt[(size_t) l].tail_off)   // gate/up scales applied as read
                                     mmq::swiglu_scaled(m.GU + r0 * 1280, m.H + r0 * 640, nr, 640, m.bounds_dev + j0, ngx,
                                                        m.grp_tail, r0, m.cs);
@@ -5810,8 +5862,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     mmq::swiglu(m.GU + r0 * 1280, m.H + r0 * 640, nr, 640, !lay.native, m.cs);
                                 if (had_d)
                                     strata::kernels::hadamard_rows(m.H + r0 * 640, m.H + r0 * 640, nr, 640, had_block, had_sh, m.cs);
-                                pt.mark(kPfGemmD, cs);
                                 mmq::quantize(m.H + r0 * 640, nullptr, m.Hq, mmq_dt, 640, 640, nr, m.cs, m.Hscale);
+                                }
+                                }
+                                pt.mark(kPfGemmD, cs);
                                 mmq::Product dn;
                                 dn.w = m.grp_d; dn.type = mmq_dt; dn.w_rows = N; dn.w_cols = 640; dn.expert_bytes = mmq_db;
                                 dn.n = ngx; dn.xq = m.Hq; dn.bounds = m.bounds_dev + n + 1 + g * (MMQ_GROUP + 1);

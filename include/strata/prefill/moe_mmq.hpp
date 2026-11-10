@@ -75,6 +75,10 @@ struct Product {
     const int32_t* bounds = nullptr;
     const int32_t* ids = nullptr;
     int64_t total_rows = 0, max_rows = 0;
+    /// 0: the tile choice optimizes its column count against max_rows (upstream's ncols_opt).  Set: against this
+    /// value instead - the launch grid still covers max_rows, so only the tile width J changes.  A smaller value
+    /// picks a narrower J when a wider tile would cost a bigger I (the shared-memory budget decides both).
+    int64_t j_opt = 0;
     float* dst = nullptr;
     int64_t ld_dst = 0;
     const float* y_scale = nullptr;     ///< NVFP4 w4a4: the per-row activation scales (fp4_activations)
@@ -122,6 +126,14 @@ void gather_strata_q2(const uint8_t* blob, void* gu_dst, void* d_dst, void* stre
 /// h[r, k] = silu(gate) * up of GU rows [2 n_ff wide]: interleaved (gate 2k, up 2k+1: the Strata pack) or split
 /// (gate k, up n_ff + k: GGUF).  FP32 out (the down product's quantizer reads floats).
 void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interleaved, void* stream);
+/// The same launch as run(Product) for a gate/up matrix ([2 n_ff, n_cols], gate rows then up rows, an expert every
+/// `expert_bytes`), with SwiGLU in the write-back: each output element is swiglu_kernel's expression on the gate and
+/// up sums of one tile, so `dst` is H ([rows, n_ff]) and neither gate/up's [rows, 2 n_ff] output nor the pass over it
+/// exists.  false: this type/J/shape has no instantiation - the caller runs the gate/up product and then swiglu.
+bool gu(const Product& p, void* stream);
+/// True where gu() covers this type (a native pack's gate/up formats; the Strata Q2_0 pack's gathered GGUF blocks are
+/// ordinary Q2_0 blocks, so they are covered too).
+bool gu_ok(int ggml_type);
 /// swiglu (n_ff 640), then quantize() of its rows for a down product of `ggml_type`, in one pass: H never stored,
 /// the same bytes in hq.  Only where swiglu_quant_ok (a q8_1 D4 down type; gu 16-byte aligned): CUDA, the
 /// STRATA_EXPERIMENTAL_SM60 build.
