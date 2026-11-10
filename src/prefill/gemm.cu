@@ -1478,8 +1478,11 @@ bool Gemm::native_mmq(const uint16_t* X, int type, const void* W, float* Y, int6
 
     for (int64_t r0 = 0; r0 < T; r0 += R) {
         const int64_t rows = (T - r0 < R) ? T - r0 : R;
-        mmq::f16_to_f32(X + r0 * K, xf, rows * K, stream_);
-        mmq::quantize(xf, nullptr, xq, type, K, K, rows, stream_);
+        // 活性を FP16 のまま q8_1 へ (同じ値・同じ順)。未対応の型だけ FP32 に広げてから quantize する
+        if (!mmq::quantize_f16(X + r0 * K, xq, type, K, K, rows, stream_)) {
+            mmq::f16_to_f32(X + r0 * K, xf, rows * K, stream_);
+            mmq::quantize(xf, nullptr, xq, type, K, K, rows, stream_);
+        }
         mmq::set_bounds(bounds, (int32_t) rows, stream_);
         mmq::Product p;
         p.w = W;

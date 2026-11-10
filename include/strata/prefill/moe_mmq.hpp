@@ -34,6 +34,10 @@ size_t q8_bytes(int64_t rows, int64_t cols);
 /// ids is null); `x` has `ld` floats per row.
 void quantize(const float* x, const int32_t* ids, void* xq, int ggml_type, int64_t cols, int64_t ld, int64_t rows,
               void* stream, float* yscale = nullptr);
+/// `quantize` straight from FP16 activations (`ld` values per row, `ld >= cols`): the same q8_1 rows without the
+/// FP32 staging copy (f16 -> f32 is exact and the reductions run in the same order, so the bytes do not change).
+/// false when this type's q8_1 layout is not covered here - the caller then widens with f16_to_f32 and calls quantize.
+bool quantize_f16(const uint16_t* x, void* xq, int ggml_type, int64_t cols, int64_t ld, int64_t rows, void* stream);
 /// NVFP4 on Blackwell in w4a4 mode: the MMQ kernel multiplies FP4 x FP4, so its activations are NVFP4 too, with
 /// one float scale per row that `quantize` writes to `yscale` and the product reads as Product::y_scale.  Decided
 /// by the mode and a device probe of the same compile.
