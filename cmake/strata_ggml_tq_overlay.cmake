@@ -159,6 +159,18 @@ function(strata_ggml_tq_overlay LLAMA OUT)
         set(_tq_fail "the DP4A MMQ config has no J=64 CASE for ${_ty}: the I tile 128 is not applied")
       endif()
     endforeach()
+    # IQ2_XXS / IQ2_XS at J=48: their Q8_0_16 tile is 51,200 B at I=128/J=64 (over sm_61's 49,152 B) but 49,088 B at
+    # I=128/J=48, so the tall tile is reachable at that one width.  Only the J=48 row changes: switch_J picks it when
+    # the product optimizes its column count against <= 48 rows (Product::j_opt / STRATA_MMQ_JWIDE), and every other
+    # J keeps I=64, so a launch that chose J=64 before chooses the same tiles as before.  The row mapping of the
+    # weights is upstream's; only the shared-memory tile height changes (the result's summation order does not).
+    foreach(_ty IQ2_XXS IQ2_XS)
+      string(REPLACE "CASE(GGML_TYPE_${_ty}, 256, 2, 64,  48," "CASE(GGML_TYPE_${_ty}, 256, 2, 128,  48," _pd "${_pd}")
+      string(FIND "${_pd}" "CASE(GGML_TYPE_${_ty}, 256, 2, 128,  48," _hit)
+      if(_hit LESS 0)
+        set(_tq_fail "the DP4A MMQ config has no J=48 CASE for ${_ty}: the I tile 128 is not applied")
+      endif()
+    endforeach()
     file(WRITE "${_p}" "${_pd}")
   endif()
 

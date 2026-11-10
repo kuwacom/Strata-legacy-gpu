@@ -13,9 +13,13 @@
 #include "strata/prefill/mmq_kq_abi.hpp"
 
 #include <algorithm>
+#include <array>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
+#include <vector>
 
 namespace strata::prefill::mmq {
 namespace {
@@ -375,6 +379,48 @@ bool fits(int t, int64_t w_rows) {
     return true;
 }
 
+// STRATA_MMQ_JLOG=1: for each (type, shape) the first time it is launched, the tile switch_J picks and the tiles it
+// skipped with the reason (shared memory over the card's limit, or a wider J).  A check, not a default: the launch
+// itself does not change.  The per-tile work is I x J, so the block count alone does not say which is faster: the
+// weight tile is read once per (i tile, j tile) and the activation tile nty times.
+void log_j_choice(int t, const mmq_args& a) {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_MMQ_JLOG");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    if (!on) return;
+    static std::vector<std::array<long long, 4>> seen;
+    const long long key[4] = {(long long) t, (long long) a.nrows_x, (long long) a.ncols_opt, (long long) a.ncols_max};
+    for (const auto& s : seen)
+        if (s[0] == key[0] && s[1] == key[1] && s[2] == key[2] && s[3] == key[3]) return;
+    seen.push_back(std::array<long long, 4>{key[0], key[1], key[2], key[3]});
+
+    const bool fallback = a.nrows_x % 128 != 0;
+    const ggml_cuda_device_info& info = ggml_cuda_info();
+    for (int id = 0; id < info.device_count; ++id) {
+        const int cc = info.devices[id].cc;
+        const size_t smpbo = info.devices[id].smpbo;
+        int J_best = 0, ntx_best = INT_MAX;
+        std::string alts;
+        for (int J = 8; J <= 128 && ntx_best > 1; J += 8) {
+            const ggml_cuda_mmq_config c = ggml_cuda_mmq_get_config((ggml_type) t, J, fallback, cc);
+            if (c.type == GGML_TYPE_COUNT) continue;
+            const size_t nbs = mmq_get_nbytes_shared(c, cc);
+            const int ntx = (int) ((a.ncols_opt + c.J - 1) / c.J);
+            const int nty = (int) ((a.nrows_x + c.I - 1) / c.I);
+            char b[160];
+            std::snprintf(b, sizeof b, " J=%d(I=%d,smem=%zu%s,ntx=%d,nty=%d,blk=%d)", c.J, c.I, nbs,
+                          nbs > smpbo ? ">smpbo" : "", ntx, nty, ntx * nty);
+            alts += b;
+            if (nbs > smpbo) continue;
+            if (ntx < ntx_best) { J_best = J; ntx_best = ntx; }
+        }
+        std::fprintf(stderr, "strata: MMQ tile: %s rows=%lld opt=%lld max=%lld cc=%d smpbo=%zu -> J=%d%s\n",
+                     type_label(t), (long long) a.nrows_x, (long long) a.ncols_opt, (long long) a.ncols_max, cc,
+                     smpbo, J_best, alts.c_str());
+    }
+}
+
 size_t matrix_bytes(int t, int64_t rows, int64_t cols) {
     return (size_t) rows * (size_t) (cols / type_blck((int) t)) * type_bytes((int) t);
 }
@@ -597,7 +643,8 @@ void Context::run(const Product& p, void* stream) {
                         p.w_cols, p.w_rows, p.total_rows, bpr, p.total_rows, p.ld_dst,
                         p.n, p.n, p.tab ? 0 : (int64_t) (p.expert_bytes / type_bytes((int) t)), 0, 0,
                         1, 1, 0, 0, 0,
-                        p.max_rows, p.max_rows};
+                        p.max_rows, p.j_opt > 0 ? std::min(p.j_opt, p.max_rows) : p.max_rows};
+    log_j_choice((int) t, a);
     auto& ctx = *(ggml_backend_cuda_context*) ctx_;
     const cudaStream_t s = (cudaStream_t) stream;
     if (p.tab) {
@@ -859,6 +906,222 @@ void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interlea
     if (rows <= 0) return;
     swiglu_kernel<<<blocks(rows * n_ff), 256, 0, (cudaStream_t) stream>>>(gu, h, rows, n_ff, interleaved);
     ck(cudaGetLastError(), "swiglu");
+}
+
+// ---- gate/up + SwiGLU in one MMQ launch (STRATA_MMQ_GU) ----
+// The same tile as llama.cpp's mul_mat_q (the loaders and vec_dots are its own, unchanged), run twice per K tile -
+// once for the gate half of the expert's [2 n_ff] rows and once for the up half - with two accumulators.
+// mul_mat_q_process_tile keeps its accumulator inside, so its body is repeated here rather than reused: the K loop,
+// the tile_y staging and the two MMQ_TILE_NE_K dots are upstream's text; the only new parts are the second base and
+// the write-back.  A tile therefore covers I gate rows and the same I up rows, nty = n_ff/I tiles instead of 2 n_ff/I,
+// and H is written already combined.  Every dot and every partial sum is the one the two-product path computes (same
+// loader, same vec_dot, same K order), and the combine is swiglu_kernel's expression term for term (mmq::swiglu,
+// non-interleaved: g / (1 + __expf(-g)) * u), so the launch produces the same bits.
+#if !defined(__HIPCC__)
+template <ggml_type type, int J>
+static __device__ __forceinline__ void mmq_gu_write_back(const float * __restrict__ sg, const float * __restrict__ su,
+                                                         const int32_t * __restrict__ ids_dst, float * __restrict__ dst,
+                                                         const int stride, const int col0, const int i_max, const int j_max) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, false) / warp_size;
+    constexpr int I         = ggml_cuda_mmq_get_I(type, J, false);
+
+#pragma unroll
+    for (int j0 = 0; j0 < J; j0 += nwarps) {
+        const int j = j0 + threadIdx.y;
+        if (j > j_max) {
+            return;
+        }
+#pragma unroll
+        for (int i0 = 0; i0 < I; i0 += warp_size) {
+            const int i = i0 + threadIdx.x;
+            if (i > i_max) {
+                continue;
+            }
+            const int k = (j0/nwarps) * (I/warp_size) + i0/warp_size;
+            const float g = sg[k], u = su[k];
+            dst[ids_dst[j]*stride + col0 + i] = g / (1.0f + __expf(-g)) * u;
+        }
+    }
+}
+
+template <ggml_type type, int J>
+__launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, false), ggml_cuda_mmq_get_occupancy(type, J, false))
+static __global__ void mul_mat_q_gu(
+        const char * __restrict__ x, const char * __restrict__ x_up, const int * __restrict__ y,
+        const int32_t * __restrict__ ids_dst,
+        const int32_t * __restrict__ expert_bounds, float * __restrict__ dst,
+        const int nrows_half, const int ncols_x, const int stride_row_x, const int ncols_y, const int stride_col_dst) {
+    if (ggml_cuda_mmq_get_config(type, J, false).type == GGML_TYPE_COUNT) {
+        NO_DEVICE_CODE;
+        return;
+    }
+
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, false) / warp_size;
+    constexpr int qk        = ggml_cuda_type_traits<type>::qk;
+    constexpr int I         = ggml_cuda_mmq_get_I(type, J, false);
+    constexpr int ITER_K    = ggml_cuda_mmq_get_K_vram(type, J, false);
+    constexpr int sz        = sizeof(block_q8_1_mmq) / sizeof(int);
+    constexpr ggml_cuda_mmq_load_tiles_t load_tiles = ggml_cuda_mmq_get_load_tiles<type, J, false>();
+    constexpr ggml_cuda_mmq_vec_dot_t    vec_dot    = ggml_cuda_mmq_get_vec_dot<type, J, false>();
+
+    extern __shared__ int data_mul_mat_q[];
+    int * ids_shared = data_mul_mat_q;                          // the ids, as mul_mat_q_process_tile expects them
+    int * tile_y = data_mul_mat_q + J;
+    int * tile_x = tile_y + GGML_PAD(J*MMQ_TILE_Y_K, nwarps*warp_size);
+
+    const int it = blockIdx.x, jt = blockIdx.y, zt = blockIdx.z;
+
+    const int col_low  = expert_bounds[zt + 0];
+    const int col_high = expert_bounds[zt + 1];
+    const int col_diff = col_high - col_low;
+    if (jt*J >= col_diff) {
+        return;
+    }
+
+    for (int j0 = 0; j0 < J; j0 += nwarps*warp_size) {
+        const int j = j0 + threadIdx.y*warp_size + threadIdx.x;
+        if (j0 + nwarps*warp_size > J && j >= J) {
+            break;
+        }
+        ids_shared[j] = ids_dst[col_low + jt*J + j];
+    }
+    __syncthreads();
+
+    const int offset_y = (col_low + jt*J)*sz;
+    const int offset_x = zt*2*nrows_half*stride_row_x + it*I*stride_row_x;
+    const char * xg = x, * xu = x_up;   // gate rows [0, nrows_half) and the up half above them
+
+    float sg[J*I / (nwarps*warp_size)] = {0.0f};
+    float su[J*I / (nwarps*warp_size)] = {0.0f};
+
+    constexpr int blocks_per_iter = ITER_K / qk;
+    const int kb_stop = ncols_x / qk, tile_x_max_i = nrows_half - it*I - 1, tile_y_max_j = col_diff - jt*J - 1;
+
+    for (int half = 0; half < 2; ++half) {
+        float * sum = half == 0 ? sg : su;
+        const char * xb = half == 0 ? xg : xu;
+        for (int kb0 = 0; kb0 < kb_stop; kb0 += blocks_per_iter) {
+            load_tiles(xb, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
+            {
+                const int * by0 = y + ncols_y * (kb0 * qk / QK8_1_MMQ) * sz;
+#pragma unroll
+                for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
+                    const int l = l0 + threadIdx.y*warp_size + threadIdx.x;
+                    tile_y[l] = by0[offset_y + l];
+                }
+            }
+            __syncthreads();
+            vec_dot(tile_x, tile_y, sum, 0);
+            __syncthreads();
+            {
+                const int * by0 = y + ncols_y * ((kb0 * qk / QK8_1_MMQ) * sz + sz);
+#pragma unroll
+                for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
+                    const int l = l0 + threadIdx.y*warp_size + threadIdx.x;
+                    tile_y[l] = by0[offset_y + l];
+                }
+            }
+            __syncthreads();
+            vec_dot(tile_x, tile_y, sum, MMQ_TILE_NE_K);
+            __syncthreads();
+        }
+    }
+
+    mmq_gu_write_back<type, J>(sg, su, ids_shared, dst, stride_col_dst, it*I, tile_x_max_i, tile_y_max_j);
+}
+
+// The same tile choice as switch_J, restricted to the J this kernel is instantiated at: false when none of them fits
+// or covers the shape (the caller then runs the two products and swiglu, as before).
+template <ggml_type type>
+static bool launch_gu(const mmq_args & a, cudaStream_t stream) {
+    const int id = ggml_cuda_get_device();
+    const int cc = ggml_cuda_info().devices[id].cc;
+    const int warp_size = ggml_cuda_info().devices[id].warp_size;
+    const size_t smpbo  = ggml_cuda_info().devices[id].smpbo;
+    const int64_t half  = a.nrows_x / 2;
+
+    int J_best = 0, ntx_best = INT_MAX;
+    for (int J : {64, 48}) {
+        const ggml_cuda_mmq_config c = ggml_cuda_mmq_get_config(type, J, false, cc);
+        if (c.type == GGML_TYPE_COUNT || mmq_get_nbytes_shared(c, cc) > smpbo) continue;
+        if (half % c.I != 0) continue;
+        const int ntx = (int) ((a.ncols_opt + c.J - 1) / c.J);
+        if (ntx < ntx_best) { J_best = J; ntx_best = ntx; }
+    }
+    if (J_best == 0) return false;
+
+    const ggml_cuda_mmq_config c = ggml_cuda_mmq_get_config(type, J_best, false, cc);
+    const size_t nbytes_shared = mmq_get_nbytes_shared(c, cc);
+    const dim3 block_dims(warp_size, c.nthreads / warp_size, 1);
+    const dim3 grid((unsigned) (half / c.I), (unsigned) ((a.ncols_max + c.J - 1) / c.J), (unsigned) a.nchannels_y);
+    const int ncols_x = (int) a.ncols_x, stride_row_x = (int) a.stride_row_x;
+    const int ncols_y = (int) a.ncols_y, stride_dst = (int) a.nrows_dst;
+    const char * x_up = a.x + (size_t) half*stride_row_x*type_bytes((int) type);
+
+    switch (J_best) {
+        case 48:
+            CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q_gu<type, 48>), nbytes_shared);
+            mul_mat_q_gu<type, 48><<<grid, block_dims, nbytes_shared, stream>>>(
+                a.x, x_up, a.y, a.ids_dst, a.expert_bounds, a.dst, (int) half, ncols_x, stride_row_x, ncols_y,
+                stride_dst);
+            break;
+        case 64:
+            CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q_gu<type, 64>), nbytes_shared);
+            mul_mat_q_gu<type, 64><<<grid, block_dims, nbytes_shared, stream>>>(
+                a.x, x_up, a.y, a.ids_dst, a.expert_bounds, a.dst, (int) half, ncols_x, stride_row_x, ncols_y,
+                stride_dst);
+            break;
+        default:
+            return false;
+    }
+    ck(cudaGetLastError(), "mul_mat_q_gu");
+    return true;
+}
+#endif   // !__HIPCC__
+
+bool gu_ok(int t) {
+#if !defined(__HIPCC__)
+    switch ((ggml_type) t) {
+        case GGML_TYPE_Q2_0:
+        case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ3_S:
+            return true;
+        default:
+            return false;
+    }
+#else
+    (void) t;
+    return false;
+#endif
+}
+
+bool gu(const Product& p, void* stream) {
+#if !defined(__HIPCC__)
+    if (p.n <= 0 || p.max_rows <= 0 || p.tab != nullptr || p.y_scale != nullptr) return false;
+    const ggml_type t = (ggml_type) p.type;
+    if (!gu_ok((int) t) || p.w_rows % 2 != 0 || p.expert_bytes % 2 != 0) return false;
+    const int64_t qk = type_blck((int) t), bpr = p.w_cols / qk;
+    // the same mmq_args run() builds for the gate/up product; the kernel reads the up half at +nrows_x/2 rows of `w`
+    const mmq_args a = {(const char*) p.w, t, (const int*) p.xq, p.ids, p.bounds, p.dst, p.y_scale,
+                        p.w_cols, p.w_rows, p.total_rows, bpr, p.total_rows, p.ld_dst,
+                        p.n, p.n, p.expert_bytes / type_bytes((int) t), 0, 0,
+                        1, 1, 0, 0, 0,
+                        p.max_rows, p.j_opt > 0 ? std::min(p.j_opt, p.max_rows) : p.max_rows};
+    switch (t) {
+        case GGML_TYPE_Q2_0:    return launch_gu<GGML_TYPE_Q2_0>(a, (cudaStream_t) stream);
+        case GGML_TYPE_IQ2_XXS: return launch_gu<GGML_TYPE_IQ2_XXS>(a, (cudaStream_t) stream);
+        case GGML_TYPE_IQ2_XS:  return launch_gu<GGML_TYPE_IQ2_XS>(a, (cudaStream_t) stream);
+        case GGML_TYPE_IQ2_S:   return launch_gu<GGML_TYPE_IQ2_S>(a, (cudaStream_t) stream);
+        case GGML_TYPE_IQ3_XXS: return launch_gu<GGML_TYPE_IQ3_XXS>(a, (cudaStream_t) stream);
+        case GGML_TYPE_IQ3_S:   return launch_gu<GGML_TYPE_IQ3_S>(a, (cudaStream_t) stream);
+        default:                return false;
+    }
+#else
+    (void) p; (void) stream;
+    return false;
+#endif
 }
 
 bool swiglu_quant_ok(int t) {
