@@ -450,6 +450,125 @@ void quantize(const float* x, const int32_t* ids, void* xq, int t, int64_t cols,
     ck(cudaGetLastError(), "quantize");
 }
 
+namespace {
+// dense の活性は FP16 で来る。従来は f16_to_f32 で FP16 の dequant scratch に広げてから quantize() に読ませており、
+// T x K の値を 2 回余計に往復していた (chunk を 1024 token ずつの起動に切るので、K=2560 で 1 起動あたり ~90 us:
+// 640 列の shared expert gate/up では呼び出し時間の 3 割、6144 列の out projection でも 2 割)。
+// ここでは FP16 から直接 q8_1 の行を書く。値も順序も同じ (f16 -> f32 は正確、amax/sum の縮約は同じ 4 値の組と
+// 同じ warp shuffle を同じ順で回す) ので、widening したコピーに対して quantize() が書くバイトと同一になる。
+template <mmq_q8_1_ds_layout ds_layout>
+__global__ void quantize_mmq_q8_1_f16(const __half* __restrict__ x, void* __restrict__ vy, const int64_t ne00,
+                                     const int64_t s01, const int64_t ne0, const int ne1) {
+    constexpr int vals_per_scale = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 64 : 32;
+    constexpr int vals_per_sum   = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 16 : 32;
+
+    const int64_t i0 = ((int64_t) blockDim.x * blockIdx.y + threadIdx.x) * 4;
+    if (i0 >= ne0) {
+        return;
+    }
+
+    const __half * xh = x + (int64_t) blockIdx.x * s01 + i0;   // ids なし: 行 = token
+    const float4 xi = i0 < ne00 ? make_float4(__half2float(xh[0]), __half2float(xh[1]), __half2float(xh[2]),
+                                              __half2float(xh[3]))
+                                : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+
+    float amax = fabsf(xi.x);
+    amax = fmaxf(amax, fabsf(xi.y));
+    amax = fmaxf(amax, fabsf(xi.z));
+    amax = fmaxf(amax, fabsf(xi.w));
+#pragma unroll
+    for (int offset = vals_per_scale/8; offset > 0; offset >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset, WARP_SIZE));
+    }
+
+    float sum;
+    if (ds_layout != MMQ_Q8_1_DS_LAYOUT_D4) {
+        sum = xi.x + xi.y + xi.z + xi.w;
+#pragma unroll
+        for (int offset = vals_per_sum/8; offset > 0; offset >>= 1) {
+            sum += __shfl_xor_sync(0xFFFFFFFF, sum, offset, WARP_SIZE);
+        }
+    }
+
+    const float d_inv = 127.0f / amax;
+    char4 q;
+    q.x = roundf(xi.x*d_inv);
+    q.y = roundf(xi.y*d_inv);
+    q.z = roundf(xi.z*d_inv);
+    q.w = roundf(xi.w*d_inv);
+    const float d = 1.0f / d_inv;
+
+    block_q8_1_mmq * y = (block_q8_1_mmq *) vy;
+    const int64_t k_block = i0 / QK8_1_MMQ;
+    const int64_t iqs     = i0 % QK8_1_MMQ;
+    const int64_t ib      = k_block*ne1 + blockIdx.x;
+    char4 * yqs4 = (char4 *) y[ib].qs;
+    yqs4[iqs/4] = q;
+    if (ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6) {
+        if (iqs % 16 == 0 && iqs < 96) {
+            y[ib].d2s6[2 + iqs/16] = sum;
+            if (iqs % 64 == 0) {
+                y[ib].d2s6[iqs/64] = d;
+            }
+        }
+    } else if (iqs % 32 == 0) {
+        if (ds_layout == MMQ_Q8_1_DS_LAYOUT_DS4) {
+            y[ib].ds4[iqs/32] = make_half2(d, sum);
+        } else {
+            y[ib].d4[iqs/32] = d;
+        }
+    }
+}
+// quantize.cu の mmq_get_q8_1_ds_layout (静的関数なのでここからは見えない) と同じ表。false = 未対応の型
+bool q8_1_layout(int t, mmq_q8_1_ds_layout& lay) {
+    switch ((ggml_type) t) {
+        case GGML_TYPE_Q1_0: case GGML_TYPE_Q2_0: case GGML_TYPE_Q5_0: case GGML_TYPE_Q8_0:
+        case GGML_TYPE_MXFP4: case GGML_TYPE_NVFP4: case GGML_TYPE_Q3_K: case GGML_TYPE_Q6_K:
+        case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ2_S: case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S: case GGML_TYPE_IQ4_XS: case GGML_TYPE_IQ4_NL:
+            lay = MMQ_Q8_1_DS_LAYOUT_D4;
+            return true;
+        case GGML_TYPE_Q4_0: case GGML_TYPE_Q4_1: case GGML_TYPE_Q5_1: case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K: case GGML_TYPE_IQ1_S:
+            lay = MMQ_Q8_1_DS_LAYOUT_DS4;
+            return true;
+        case GGML_TYPE_Q2_K:
+            lay = MMQ_Q8_1_DS_LAYOUT_D2S6;
+            return true;
+        default:
+            return false;
+    }
+}
+}  // namespace
+
+bool quantize_f16(const uint16_t* x, void* xq, int t, int64_t cols, int64_t ld, int64_t rows, void* stream) {
+    if (rows <= 0) return true;   // 何も書かない
+    if (cols % 4 != 0 || ld < cols) return false;
+    mmq_q8_1_ds_layout lay;
+    if (!q8_1_layout(t, lay)) return false;
+    const int64_t ne0 = pad512(cols);
+    constexpr int kThreads = 128;   // quantize.cuh の CUDA_QUANTIZE_BLOCK_SIZE_MMQ と同じ
+    const dim3 num_blocks((unsigned) rows, (unsigned) ((ne0 + 4 * kThreads - 1) / (4 * kThreads)), 1);
+    const dim3 block_size(kThreads, 1, 1);
+    const __half* xh = (const __half*) x;
+    switch (lay) {
+        case MMQ_Q8_1_DS_LAYOUT_D4:
+            quantize_mmq_q8_1_f16<MMQ_Q8_1_DS_LAYOUT_D4><<<num_blocks, block_size, 0, (cudaStream_t) stream>>>(
+                xh, xq, cols, ld, ne0, (int) rows);
+            break;
+        case MMQ_Q8_1_DS_LAYOUT_DS4:
+            quantize_mmq_q8_1_f16<MMQ_Q8_1_DS_LAYOUT_DS4><<<num_blocks, block_size, 0, (cudaStream_t) stream>>>(
+                xh, xq, cols, ld, ne0, (int) rows);
+            break;
+        default:
+            quantize_mmq_q8_1_f16<MMQ_Q8_1_DS_LAYOUT_D2S6><<<num_blocks, block_size, 0, (cudaStream_t) stream>>>(
+                xh, xq, cols, ld, ne0, (int) rows);
+            break;
+    }
+    ck(cudaGetLastError(), "quantize_f16");
+    return true;
+}
+
 void quantize_scatter(const float* x, const int32_t* slot, const int32_t* src, void* xq, int t, int64_t cols, int64_t ld,
                       int64_t tokens, int k_used, void* stream) {
     if (tokens <= 0 || k_used <= 0) return;
@@ -587,6 +706,17 @@ size_t overread_bytes(int t, int64_t cols) {
             if (c.type != GGML_TYPE_COUNT) blocks = std::max<int64_t>(blocks, over(c.K_vram));
         }
     return (size_t) blocks * type_bytes((int) t);
+}
+
+bool k_in_padding(int t, int64_t cols) {
+    if (!supported(t) || cols <= 0) return false;
+    const int64_t qk = type_blck((int) t);
+    if (qk <= 0 || cols % qk != 0) return false;   // K/qk の切り捨てで末尾の半端なブロックが落ちる形は不可
+    const size_t ob = overread_bytes(t, cols);
+    if (ob == 0) return true;
+    // 読み越しは「次の行の頭」と「行列の末尾の先」を読むだけで、積は活性の詰め物 (pad512) のゼロスケールと掛かる
+    const int64_t over = (int64_t) (ob / type_bytes((int) t)) * qk;
+    return cols + over <= pad512(cols);
 }
 
 bool whole_tiles(int t, int64_t w_rows, int n_experts) {
