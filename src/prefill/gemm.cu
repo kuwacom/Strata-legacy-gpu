@@ -1,5 +1,6 @@
 // src/prefill/gemm.cu - see include/strata/prefill/gemm.hpp.
 #include "strata/prefill/gemm.hpp"
+#include "strata/prefill/dense_i8.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
 #if defined(STRATA_PREFILL_MMQ)
 #include "strata/prefill/moe_mmq.hpp"
@@ -1608,6 +1609,15 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
                              "copied unpadded (no device memory)\n", (long long) ldx, (long long) K);
         std::exit(1);
     }
+#if !defined(__HIPCC__)
+    // STRATA_DENSE_I8: the weight expanded to int8 once per call and a plain DP4A GEMM (dense_i8.cu).  The int8
+    // weight is a 127-level image of the packed blocks rather than their exact values (4 bit -> 8 bit costs the
+    // last 3% of one level), so unlike the FP16 path this is not bitwise - quality goes through needle/QA
+    // (docs/prefill/v7-round.md, the same gate the dense MMQ path was adopted with).
+    if (beta == 0.0f && (ldx == 0 || ldx == K) && dense_i8::enabled() &&
+        dense_i8::run(X, ggml_type, W_blocks, Y, T, N, K, ldy > 0 ? ldy : N, stream_))
+        return;
+#endif
 #if defined(STRATA_PREFILL_MMQ)
     if (beta == 0.0f && (ldx == 0 || ldx == K) && native_mmq(X, ggml_type, W_blocks, Y, T, N, K, ldy)) return;
 #endif

@@ -851,6 +851,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     # v100/gdn-chunk: the chunked Volta GDN prompt recurrence.  The dispatch (src/prefill/kernels.cu) is
     # Volta-only (cc 7.0) and gated on STRATA_EXPERIMENTAL_SM60; the path itself stays opt-in (STRATA_GDN_CHUNK).
     target_sources(strata_prefill PRIVATE src/prefill/gdn_chunk.cu)
+    # STRATA_DENSE_I8: the dense projections with their weights expanded to int8 once per call and a plain
+    # DP4A GEMM (dense_i8.cu; Pascal-class cards have no int8 tensor cores, llama.cpp's MMQ leaves this on the table)
+    target_sources(strata_prefill PRIVATE src/prefill/dense_i8.cu)
   endif()
   if(STRATA_ENABLE_HIP AND STRATA_HIPBLASLT_AVAILABLE)
     target_compile_definitions(strata_prefill PRIVATE STRATA_HIPBLASLT_AVAILABLE=1)
@@ -1411,6 +1414,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     set_tests_properties(gemm_dequant_side_parity PROPERTIES SKIP_RETURN_CODE 77)
     add_executable(gemm_w16_parity src/prefill/gemm_w16_parity.cu)
     target_link_libraries(gemm_w16_parity PRIVATE strata_prefill )
+    # STRATA_DENSE_I8: the int8-expanded DP4A GEMM against the MMQ path and against the exact FP16 product of the
+    # same weights (GPU, synthetic, no model; T=4096 for speed and T=64 for the error)
+    add_executable(dense_i8_bench src/prefill/dense_i8_bench.cu)
+    target_link_libraries(dense_i8_bench PRIVATE strata_prefill )
     add_test(NAME gemm_w16_parity COMMAND gemm_w16_parity)
     set_tests_properties(gemm_w16_parity PROPERTIES SKIP_RETURN_CODE 77)
     # Pascal, opt-in STRATA_DENSE_F32=1: the dense projections' FP16 GEMMs as cublasSgemm on FP32 copies, bitwise vs
