@@ -1316,6 +1316,77 @@ __global__ void __launch_bounds__(kNarrowThreads) bf16_narrow_kernel(const uint1
         }
     }
 }
+
+// STRATA_HC_INJ8=1: the narrow rows (N = HC = 4) of the hyper-connection read, as their own kernel.
+// The 64 x 64 tile above spends 60 of its 64 columns on nothing when N = 4: the FMA count is 16x the useful one and
+// the launch takes 6.8 ms at T = 32768 where the memory it must move (T x K x 2 B) is 2.2 ms.  Here one warp owns
+// eight tokens and reuses each weight value across all eight, so X is read exactly once.  The k sum is a butterfly
+// over the lanes, so this is not the same order as any earlier path (the 64 x 64 narrow kernel already was not
+// bitwise either).
+constexpr int kInj8Tok = 8;                       // 1 ワープが受け持つトークン数
+constexpr int kInj8Warps = 8;                    // 1 ブロックのワープ数 (8 x 8 = 64 トークン)
+constexpr int kInj8Threads = 32 * kInj8Warps;
+constexpr int kInj8Chunk = 32 * 8;               // 1 反復で 1 ワープが進む k (1 レーンが uint4 = 8 値)
+constexpr int kInj8Cols = 4;                     // この形にするのは N == HC のときだけ
+__device__ __forceinline__ float inj8_lo(uint32_t v) { return __uint_as_float(v << 16); }
+__device__ __forceinline__ float inj8_hi(uint32_t v) { return __uint_as_float(v & 0xffff0000u); }
+__global__ void __launch_bounds__(kInj8Threads) bf16_narrow8_kernel(const uint16_t* __restrict__ X,
+                                                                   const uint16_t* __restrict__ W,
+                                                                   float* __restrict__ Y, int T, int K) {
+    const int lane = (int) threadIdx.x & 31;
+    const int warp = (int) threadIdx.x >> 5;
+    const int t0 = ((int) blockIdx.x * kInj8Warps + warp) * kInj8Tok;
+    if (t0 >= T) return;                         // このワープの 8 トークンはすべて T の外
+    float acc[kInj8Tok][kInj8Cols];
+    #pragma unroll
+    for (int t = 0; t < kInj8Tok; ++t)
+        #pragma unroll
+        for (int c = 0; c < kInj8Cols; ++c) acc[t][c] = 0.0f;
+    for (int k0 = 0; k0 < K; k0 += kInj8Chunk) {
+        const int k = k0 + lane * 8;
+        // K % 8 == 0 を受けるので、1 本の uint4 は丸ごと有効か丸ごと範囲外のどちらか
+        const bool live = k + 7 < K;
+        // 重みは 8 トークンで使い回すので、この k 断片の widen は反復に 1 度だけ行う (トークンごとにやると
+        // 同じ 32 命令を 8 回繰り返すことになる)。4 行 x 20 KB は全ブロックで共有されるので L1/L2 に載る
+        float wa[kInj8Cols][8];
+        #pragma unroll
+        for (int c = 0; c < kInj8Cols; ++c) {
+            const uint4 wv = live ? *(const uint4*) (W + (int64_t) c * K + k) : make_uint4(0u, 0u, 0u, 0u);
+            wa[c][0] = inj8_lo(wv.x); wa[c][1] = inj8_hi(wv.x);
+            wa[c][2] = inj8_lo(wv.y); wa[c][3] = inj8_hi(wv.y);
+            wa[c][4] = inj8_lo(wv.z); wa[c][5] = inj8_hi(wv.z);
+            wa[c][6] = inj8_lo(wv.w); wa[c][7] = inj8_hi(wv.w);
+        }
+        #pragma unroll
+        for (int t = 0; t < kInj8Tok; ++t) {
+            const int row = t0 + t;
+            // 8 本の行を続けて発行する (行はそれぞれ 20 KB 離れている): 1 本待つ間に次が飛ぶ
+            const uint4 xv = (live && row < T) ? *(const uint4*) (X + (int64_t) row * K + k)
+                                               : make_uint4(0u, 0u, 0u, 0u);
+            float xa[8];
+            xa[0] = inj8_lo(xv.x); xa[1] = inj8_hi(xv.x);
+            xa[2] = inj8_lo(xv.y); xa[3] = inj8_hi(xv.y);
+            xa[4] = inj8_lo(xv.z); xa[5] = inj8_hi(xv.z);
+            xa[6] = inj8_lo(xv.w); xa[7] = inj8_hi(xv.w);
+            #pragma unroll
+            for (int j = 0; j < 8; ++j)
+                #pragma unroll
+                for (int c = 0; c < kInj8Cols; ++c) acc[t][c] = fmaf(xa[j], wa[c][j], acc[t][c]);
+        }
+    }
+    #pragma unroll
+    for (int t = 0; t < kInj8Tok; ++t) {
+        const int row = t0 + t;
+        #pragma unroll
+        for (int c = 0; c < kInj8Cols; ++c) {
+            float s = acc[t][c];
+            // butterfly: どのレーンも同じ順で畳むので、同じ入力からは常に同じビットになる
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
+            if (lane == 0 && row < T) Y[(int64_t) row * kInj8Cols + c] = s;   // ldy == N だけを受ける (条件)
+        }
+    }
+}
 }  // namespace
 #endif
 
@@ -1334,6 +1405,26 @@ bool Gemm::bf16_narrow(const uint16_t* X, const uint16_t* W, float* Y, int64_t T
         (reinterpret_cast<uintptr_t>(Y) % 4) != 0)
         return false;
     if (T > (int64_t) INT_MAX || N > (int64_t) INT_MAX || K > (int64_t) INT_MAX) return false;
+    // STRATA_HC_INJ8=1: the narrow rows (inject, N = HC) get the warp-per-eight-tokens form.  The 64 x 64 tile below
+    // is 16x the useful FMAs at N = 4 (that launch reads 671 MB and takes 6.8 ms where 2.2 ms is the memory floor),
+    // so the two are not interchangeable; the down projection (N = 320) never takes this branch.
+    static const bool inj8_on = [] {
+        const char* v = std::getenv("STRATA_HC_INJ8");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    if (inj8_on && N == kInj8Cols && K % 8 == 0) {
+        static bool said8 = false;
+        if (!said8) {
+            said8 = true;
+            std::fprintf(stderr, "prefill gemm: the hyper-connection inject projection runs through the 8-token kernel "
+                                 "(STRATA_HC_INJ8=1; one warp per 8 tokens, each weight reused 8 times)\n");
+        }
+        const unsigned blocks8 = (unsigned) ((T + kInj8Tok * kInj8Warps - 1) / (kInj8Tok * kInj8Warps));
+        bf16_narrow8_kernel<<<blocks8, kInj8Threads, 0, (cudaStream_t) (stream != nullptr ? stream : stream_)>>>(
+            X, W, Y, (int) T, (int) K);
+        if (cudaGetLastError() != cudaSuccess) return false;   // 何も書いていない: 呼び出し側は従来の経路に落ちる
+        return true;
+    }
     const dim3 grid((unsigned) ((N + kNarrowBN - 1) / kNarrowBN), (unsigned) ((T + kNarrowBM - 1) / kNarrowBM));
     static bool said = false;
     if (!said) {

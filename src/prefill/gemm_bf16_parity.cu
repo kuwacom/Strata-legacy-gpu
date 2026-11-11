@@ -18,6 +18,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <string>
@@ -131,6 +132,39 @@ int main(int argc, char** argv) {
         std::printf("  %-32s T %5lld N %5lld K %5lld ldy %5lld: worst |diff| %.3e of max |ref| %.3e (rel %.2e) %s\n",
                     s.what, (long long) s.T, (long long) s.N, (long long) s.K, (long long) ldy, worst, mag, worst / mag,
                     pass ? "pass" : "FAIL");
+
+        // the narrow (hyper-connection) path over the same inputs: it takes no beta and no row stride wider than N, so
+        // only the shapes it accepts are checked, against a fresh product from the BF16 reference.  STRATA_HC_INJ8
+        // selects the form inside it (the 64 x 64 tile, or the 8-token kernel): run the test both ways to cover both.
+        if (s.N <= 512 && s.K % 32 == 0 && ldy == s.N) {
+            cudaMemset(dy, 0, ybytes);
+            if (ref(dx, zero) != CUBLAS_STATUS_SUCCESS) {
+                std::printf("FAIL: reference cublasGemmEx (narrow)\n");
+                return 1;
+            }
+            const char* inj8 = std::getenv("STRATA_HC_INJ8");
+            if (!gemm.bf16_narrow(dx, dw, dy, s.T, s.N, s.K, 0)) {
+                std::printf("  %-32s narrow: not taken on this device\n", s.what);
+            } else if (!ok_or(cudaStreamSynchronize(st), "sync")) {
+                return 1;
+            } else {
+                cudaMemcpy(y.data(), dy, ybytes, cudaMemcpyDeviceToHost);
+                cudaMemcpy(r.data(), dr, ybytes, cudaMemcpyDeviceToHost);
+                double w2 = 0.0, m2 = 1e-30;
+                int bad2 = 0;
+                for (int64_t t = 0; t < s.T; ++t)
+                    for (int64_t c = 0; c < s.N; ++c) {
+                        const float a = y[(size_t) (t * ldy + c)], b = r[(size_t) (t * ldy + c)];
+                        if (!std::isfinite(a)) ++bad2;
+                        w2 = std::max(w2, (double) std::fabs(a - b));
+                        m2 = std::max(m2, (double) std::fabs(b));
+                    }
+                const bool pass2 = bad2 == 0 && w2 <= 1e-4 * m2;
+                if (!pass2) ++failures;
+                std::printf("  %-32s narrow (STRATA_HC_INJ8=%s): worst |diff| %.3e of max |ref| %.3e (rel %.2e) %s\n",
+                            s.what, inj8 != nullptr ? inj8 : "unset", w2, m2, w2 / m2, pass2 ? "pass" : "FAIL");
+            }
+        }
 
         if (bench) {
             auto time = [&](auto&& f) {

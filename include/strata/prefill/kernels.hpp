@@ -23,6 +23,10 @@ void gr_norm_rs(const float* R, const float* w_norm, float eps, float* rs, uint1
 /// gr_mix with xn recomputed from R, rs and w_norm exactly as gr_norm computes it (the same bits).
 void gr_mix_r(const float* R, const float* rs, const float* w_norm, const float* gated, float* mixed, uint16_t* mixed16,
               int64_t T, void* stream, uint16_t* mixed_h = nullptr, uint16_t* mixed16_lo = nullptr);
+/// F-3 (opt-in STRATA_HC_MIX16=1): gr_mix_r with xn16 (the BF16 image of R * rs * w) as its input instead of R -
+/// half the bytes, and one more rounding (the mix's BF16).  The sum order is gr_mix_r's.
+void gr_mix_r16(const uint16_t* xn16, int64_t ldx, const float* gated, float* mixed, uint16_t* mixed16, int64_t T,
+                void* stream, uint16_t* mixed_h = nullptr, uint16_t* mixed16_lo = nullptr);
 /// F-2: gr_write, then gr_norm_rs of the next half (its norm weights) over the rows just written - the same bits as
 /// the two calls, without reading R back.
 /// S23 (opt-in STRATA_HC_UPMIX=1): the up projection (lo16 x w_up^T, BF16, FP32 accumulate) with gr_mix_r as its

@@ -167,6 +167,34 @@ __global__ void gr_mix_r_kernel(const float* __restrict__ R, const float* __rest
     }
     if (mixed_h) mixed_h[i] = hf(s);
 }
+// STRATA_HC_MIX16=1: gr_mix_r with the BF16 image as its input.  xn16 already holds R * rs * w rounded to BF16
+// (gr_norm_rs / gr_write_norm_rs write it for the down and inject projections), so the 40,960 B per token and half
+// that R costs - and the two multiplies per value - go away: 20,480 B for one more rounding in the mix.  The sum
+// order is gr_mix_r_kernel's, unchanged.
+__global__ void gr_mix_r16_kernel(const uint16_t* __restrict__ xn16, int64_t ldx, const float* __restrict__ g,
+                                  float* __restrict__ mixed, uint16_t* __restrict__ mixed16, int64_t T,
+                                  uint16_t* __restrict__ mixed_h, uint16_t* __restrict__ mixed16_lo) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= T * N) return;
+    const int64_t t = i / N, d = i % N;
+    float s = 0.0f;
+#pragma unroll
+    for (int c = 0; c < HC; ++c) {
+        const int64_t j = t * D + c * N + d;
+        const int64_t jx = t * ldx + c * N + d;
+        // BF16 -> float はビットの移動だけ: 値を変えずに 4 B の R を読まずに済む
+        const float x = __uint_as_float((uint32_t) xn16[jx] << 16);
+        s = fmaf(x, sigm(g[j]), s);
+    }
+    s /= (float) HC;
+    mixed[i] = s;
+    if (mixed16) {
+        const uint16_t h = act16(s);
+        mixed16[i] = h;
+        if (mixed16_lo) mixed16_lo[i] = bf_lo(s, h);
+    }
+    if (mixed_h) mixed_h[i] = hf(s);
+}
 // F-2: gr_write_kernel for one row (t, c), then gr_norm_rs_kernel's reduction over it with the next half's norm
 // weights - the same thread-to-element mapping (256 threads, stride 256) and block_sum, so rs and the BF16 image are
 // the same bits, and R is not read back
@@ -2834,6 +2862,12 @@ void gr_mix_r(const float* R, const float* rs, const float* w_norm, const float*
     gr_mix_r_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(R, rs, w_norm, gated, mixed, mixed16, T,
                                                                           mixed_h, mixed16_lo);
     check("gr_mix_r");
+}
+void gr_mix_r16(const uint16_t* xn16, int64_t ldx, const float* gated, float* mixed, uint16_t* mixed16, int64_t T,
+                void* stream, uint16_t* mixed_h, uint16_t* mixed16_lo) {
+    gr_mix_r16_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(
+        xn16, ldx > 0 ? ldx : D, gated, mixed, mixed16, T, mixed_h, mixed16_lo);
+    check("gr_mix_r16");
 }
 bool gr_upmix(const uint16_t* lo16, const uint16_t* w_up, const float* R, const float* rs, const float* w_norm,
               float* mixed, uint16_t* mixed16, uint16_t* mixed_h, int64_t T, void* stream) {

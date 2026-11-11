@@ -4169,8 +4169,44 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 } else if (gr_unfused()) {
                     gr_mix(m.xn, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h, m.mixed_bf_lo);
                 } else {
-                    gr_mix_r(m.R, m.grs, (const float*) wn->data, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h,
-                             m.mixed_bf_lo);
+                    // STRATA_HC_MIX16=1: xn16 は R * rs * w を BF16 に丸めたものなので、R (4 B/値) を読んで
+                    // rs と w を掛け直す代わりに 2 B/値を読む。xn16 が BF16 で、低い側の像が無いときだけ
+                    static const bool mix16 = [] {
+                        const char* e = std::getenv("STRATA_HC_MIX16");
+                        return e != nullptr && e[0] != '\0' && e[0] != '0';
+                    }();
+                    // STRATA_HC_MIX16_CHECK=n: the first n halves also run gr_mix_r and report how far the BF16 image
+                    // moves the result (the same pattern as STRATA_HC_UPMIX_CHECK below; a prefix, since the kernel is
+                    // elementwise in t).  xn16 stale at layer 0 would show up here as a large number
+                    static int mix16_checks = [] {
+                        const char* e = std::getenv("STRATA_HC_MIX16_CHECK");
+                        return e ? std::atoi(e) : 0;
+                    }();
+                    if (mix16 && !xf16 && m.xn16_lo == nullptr && ldx == D) {
+                        if (mix16_checks > 0) {
+                            --mix16_checks;
+                            const int64_t tc = std::min<int64_t>(T, 8192);
+                            gr_mix_r(m.R, m.grs, (const float*) wn->data, m.gated, m.mixed, nullptr, tc, m.cs);
+                            std::vector<float> ref((size_t) tc * N), got((size_t) tc * N);
+                            cudaMemcpyAsync(ref.data(), m.mixed, ref.size() * 4, cudaMemcpyDeviceToHost, m.cs);
+                            gr_mix_r16(m.xn16, ldx, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h, m.mixed_bf_lo);
+                            cudaMemcpyAsync(got.data(), m.mixed, got.size() * 4, cudaMemcpyDeviceToHost, m.cs);
+                            cudaStreamSynchronize(m.cs);
+                            double e2 = 0, r2 = 0, emax = 0;
+                            for (size_t i = 0; i < ref.size(); ++i) {
+                                const double dd = (double) got[i] - ref[i];
+                                e2 += dd * dd; r2 += (double) ref[i] * ref[i]; emax = std::max(emax, std::fabs(dd));
+                            }
+                            std::fprintf(stderr, "strata: STRATA_HC_MIX16_CHECK layer %lld half %d T %lld: mixed rel RMS %.3e, "
+                                         "max |diff| %.3e\n", (long long) l, half, (long long) T,
+                                         std::sqrt(e2 / std::max(r2, 1e-30)), emax);
+                        } else {
+                            gr_mix_r16(m.xn16, ldx, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h, m.mixed_bf_lo);
+                        }
+                    } else {
+                        gr_mix_r(m.R, m.grs, (const float*) wn->data, m.gated, m.mixed, m.mixed_bf, T, m.cs,
+                                 m.mixed_h, m.mixed_bf_lo);
+                    }
                 }
 
                 if (wd_q8.data) {   // the HC GEMMs that read the scratch are enqueued: the next user waits for them
