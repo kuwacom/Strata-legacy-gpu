@@ -35,12 +35,26 @@ They are built by `.github/workflows/fork-images.yml`, which compiles the engine
 - on a push to `main` that touches `src/`, `include/`, `cmake/`, `CMakeLists.txt`, `packaging/`, `docker/` or
   `scripts/ci-build-engine.sh`, publishing `:edge` and `:sha-<commit>`.
 
-Every build compiles each listed architecture, so it runs for a couple of hours: the default list is the five that
+A first run on a 4-core runner took **37 minutes** end to end (engine for five architectures, the image, the push).
+Every build compiles each listed architecture, so a wider list costs proportionally more: the default list is the five that
 matter, and `archs` adds 60 (P100) or 70 (V100) when needed. The package is private on GHCR until it is made public
 once in the package settings.
 
 To pin the P40 numbers in this repository's docs, use the same image tag the measurements were made with
 (`strata:fork-v9` locally, engine 0.1.57); the fork image above is that engine built portably for several cards.
+
+### Running the fork image
+
+```bash
+docker run -d --name strata --gpus all \
+  -e MODEL=IQ3_XXS -e FAMILY=qwen -e CONTEXT=512k -e PARALLEL=1 -e VISION=off -e TUNE=skip \
+  -e API_KEY=<key> \
+  -e STRATA_SET="ple-io=ram prefill=32768 kv-resident=32768 draft-conf=0.7 STRATA_DENSE_F32=1 rope-scaling=yarn rope-scale=2 STRATA_DENSE_MMQ=1 STRATA_MMQ_KQ=1 spec=4 STRATA_PATTN_SM60=1 STRATA_SELECT_SIMT=1 STRATA_HC_DOWN_BF16=1 STRATA_MMQ_SQ=1 STRATA_HC_INJ8=1 STRATA_HC_MIX16=1 STRATA_HC_MIXINJ=1" \
+  -v strata-data:/data -p 8080:8080 ghcr.io/kuwacom/strata-legacy-gpu:cuda12
+```
+
+`STRATA_SET` is the set the P40 measurements in `docs/p40/` were made with; without it the image runs the upstream
+defaults. The switches are documented in `docs/prefill/prefill-knobs.md`.
 
 ## Quick start
 
