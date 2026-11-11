@@ -203,50 +203,63 @@ __device__ __forceinline__ void score_chunk_x(const float4 (&qa)[G], const float
 }
 
 // ps_score_kernel with score_chunk_x (q loaded in the permuted slot order)
+// cpc = 1 CTA が回すチャンク数。チャンクループの手前（q の LDG.128 24 本と ids/step のアドレス計算。1 チャンク
+// 2,171 スレッド命令のうち 467）は CTA ごとの仕事なので、cpc=4 ならその分を 4 チャンクで 1 回だけ払う。
+// チャンクは自分の codes / rows / sp / softmax をそのまま持ち、各セルが見るオペランドと順序は変わらないので
+// 出力は cpc=1 とバイト単位で同じになる。
 template <int UNR>
 __global__ void __launch_bounds__(THREADS, 2) ps_score_x_kernel(const float* __restrict__ q, QsaAttnPools p,
                                                                 const int32_t* __restrict__ ids,
                                                                 const int32_t* __restrict__ step, int n_kv_heads,
                                                                 int page_size, float scale, float* __restrict__ blocks,
-                                                                int n_chunks, int cap) {
+                                                                int n_chunks, int cap, int cpc) {
     q += (size_t) blockIdx.z * (size_t) (n_kv_heads * G) * HD;
     ids += (size_t) blockIdx.z * (size_t) cap;
     step += (size_t) blockIdx.z * kStepCount;
-    const int chunk = blockIdx.x, kvh = blockIdx.y;
-    float* const blk = blocks + (((size_t) blockIdx.z * n_kv_heads + kvh) * n_chunks + chunk) * PS_BLK;
+    const int kvh = blockIdx.y;
+    const int chunk0 = blockIdx.x * cpc;
+    float* const blk_head = blocks + ((size_t) blockIdx.z * n_kv_heads + kvh) * n_chunks * PS_BLK;
     __shared__ __align__(16) int8_t sk[CHUNK][HD];
     __shared__ __align__(16) float sks[CHUNK][NSC];
     __shared__ float sp[G][CHUNK];
-    __shared__ long long srow[CHUNK];
+    // srow を 2 面に持つ: チャンク c の softmax が srow を読んでいる間にチャンク c+1 の srow を書けるので、
+    // ループ先頭に余分な barrier を置かずに済む（cpc=1 の命令列と barrier の回数を元のカーネルと同じに保つ）
+    __shared__ long long srow[2][CHUNK];
     const int n_ids = __ldg(step + kStepWidth);
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
-    const int c0 = chunk * CHUNK;
-    const int n_here = min(CHUNK, n_ids - c0);
-    if (n_here <= 0) {
-        if (t < G) { blk[G * CHUNK + 2 * CHUNK + t] = -FLT_MAX; blk[G * CHUNK + 2 * CHUNK + G + t] = 0.0f; }
-        return;
-    }
-    if (t < CHUNK) {
-        const long long r = cell_row(p, ids, c0, t, n_here, n_kv_heads, kvh, page_size);
-        srow[t] = r;
-        reinterpret_cast<long long*>(blk + G * CHUNK)[t] = r;
-    }
     float4 qa[G], qb[G];
     load_q_perm(q + (size_t) (kvh * G) * HD, lane, qa, qb);
-    __syncthreads();
-    stage_rows(p.k_q, p.k_scale, srow, n_here, t, sk, sks);
-    __syncthreads();
-    score_chunk_x<UNR>(qa, qb, sk, sks, srow, sp, n_here, scale, warp, lane);
-    __syncthreads();
-    for (int h = warp; h < G; h += WARPS) {
-        const float a = sp[h][lane], b = sp[h][lane + 32];
-        const float m = warp_max_x(fmaxf(a, b));
-        const float ea = (lane < n_here && srow[lane] >= 0) ? __expf(a - m) : 0.0f;
-        const float eb = (lane + 32 < n_here && srow[lane + 32] >= 0) ? __expf(b - m) : 0.0f;
-        blk[h * CHUNK + lane] = ea;
-        blk[h * CHUNK + lane + 32] = eb;
-        const float l = warp_sum_x(ea + eb);
-        if (lane == 0) { blk[G * CHUNK + 2 * CHUNK + h] = m; blk[G * CHUNK + 2 * CHUNK + G + h] = l; }
+    for (int cc = 0; cc < cpc; ++cc) {
+        const int chunk = chunk0 + cc;
+        if (chunk >= n_chunks) break;
+        float* const blk = blk_head + (size_t) chunk * PS_BLK;
+        const int c0 = chunk * CHUNK;
+        const int n_here = min(CHUNK, n_ids - c0);
+        if (n_here <= 0) {
+            if (t < G) { blk[G * CHUNK + 2 * CHUNK + t] = -FLT_MAX; blk[G * CHUNK + 2 * CHUNK + G + t] = 0.0f; }
+            break;   // the chunks after this one are past the width too
+        }
+        long long* const row = srow[cc & 1];
+        if (t < CHUNK) {
+            const long long r = cell_row(p, ids, c0, t, n_here, n_kv_heads, kvh, page_size);
+            row[t] = r;
+            reinterpret_cast<long long*>(blk + G * CHUNK)[t] = r;
+        }
+        __syncthreads();
+        stage_rows(p.k_q, p.k_scale, row, n_here, t, sk, sks);
+        __syncthreads();
+        score_chunk_x<UNR>(qa, qb, sk, sks, row, sp, n_here, scale, warp, lane);
+        __syncthreads();
+        for (int h = warp; h < G; h += WARPS) {
+            const float a = sp[h][lane], b = sp[h][lane + 32];
+            const float m = warp_max_x(fmaxf(a, b));
+            const float ea = (lane < n_here && row[lane] >= 0) ? __expf(a - m) : 0.0f;
+            const float eb = (lane + 32 < n_here && row[lane + 32] >= 0) ? __expf(b - m) : 0.0f;
+            blk[h * CHUNK + lane] = ea;
+            blk[h * CHUNK + lane + 32] = eb;
+            const float l = warp_sum_x(ea + eb);
+            if (lane == 0) { blk[G * CHUNK + 2 * CHUNK + h] = m; blk[G * CHUNK + 2 * CHUNK + G + h] = l; }
+        }
     }
 }
 
@@ -401,6 +414,17 @@ bool sm6x_device() {
 
 }  // namespace
 
+// ps_score_x_kernel の 1 CTA が回すチャンク数（STRATA_PATTN_CPC、1..8、既定 4）。prologue は CTA ごとなので 4 で
+// 1/4 に償却できる。プロセスで 1 回だけ読む。範囲外は 1 以上 8 以下へ丸める（grid が全チャンクを覆うように）
+int pattn_cpc() {
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_PATTN_CPC");
+        const int x = e != nullptr && *e != '\0' ? std::atoi(e) : 4;
+        return x < 1 ? 1 : (x > 8 ? 8 : x);
+    }();
+    return v;
+}
+
 bool qsa_pattn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
                      const QsaShapes& s, float* scratch, uint64_t scratch_floats, float* attn, int64_t n_q,
                      void* stream) {
@@ -419,6 +443,13 @@ bool qsa_pattn_batch_any_arch(const float* q, const QsaAttnPools& pools, const i
     const int n_chunks = (int) ((cap + CHUNK - 1) / CHUNK);
     const float scale = 1.0f / sqrtf((float) HD);
     if (n_chunks > NCM) return false;   // a longer selection keeps the usual path
+    const int cpc = pattn_cpc();
+    // どの変種を測ったかが A/B のログから分かるようにプロセスで 1 回だけ出す
+    static bool said = false;
+    if (!said) {
+        said = true;
+        std::fprintf(stderr, "strata pattn: chunks per score CTA %d (STRATA_PATTN_CPC)\n", cpc);
+    }
     // the scratch holds the blocks of one batch of queries (probabilities, rows, m and l of every chunk), evenly split
     const uint64_t per_q = (uint64_t) s.n_head_kv * (uint64_t) n_chunks * PS_BLK;
     const int64_t max_batch = (int64_t) (scratch_floats / per_q);
@@ -427,15 +458,16 @@ bool qsa_pattn_batch_any_arch(const float* q, const QsaAttnPools& pools, const i
     const int64_t batch = (n_q + n_batches - 1) / n_batches;
     for (int64_t t0 = 0; t0 < n_q; t0 += batch) {
         const int64_t nb = n_q - t0 < batch ? n_q - t0 : batch;
-        const dim3 g1((unsigned) n_chunks, (unsigned) s.n_head_kv, (unsigned) nb);
+        const int64_t g1x = (n_chunks + cpc - 1) / cpc;
+        const dim3 g1((unsigned) g1x, (unsigned) s.n_head_kv, (unsigned) nb);
         const dim3 g2((unsigned) s.n_head_kv, (unsigned) nb);
         const float* qb = q + (size_t) t0 * s.n_head * HD;
         const int32_t* ib = ids + (size_t) t0 * cap;
         const int32_t* sb = steps + (size_t) t0 * kStepCount;
         ps_score_x_kernel<1><<<g1, THREADS, 0, st>>>(qb, pools, ib, sb, (int) s.n_head_kv, (int) s.page_size, scale,
-                                                     scratch, n_chunks, (int) cap);
-        ps_value_d4_kernel<<<g2, 64, 0, st>>>(pools, sb, scratch, (int) s.n_head_kv, n_chunks,
-                                              attn + (size_t) t0 * s.n_head * HD);
+                                                     scratch, n_chunks, (int) cap, cpc);
+        float* const out = attn + (size_t) t0 * s.n_head * HD;
+        ps_value_d4_kernel<<<g2, 64, 0, st>>>(pools, sb, scratch, (int) s.n_head_kv, n_chunks, out);
     }
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
