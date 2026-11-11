@@ -128,6 +128,38 @@ the consolidated build recipe is in `docs/build/`.
 - `docs/integration/` - v2/v3 integrated builds
 - `docs/patches/` - the patches applied in each experiment
 
+## Document index
+
+Start with `docs/p40/README.md` (this file) and `docs/references/p40-roofline.md`.
+The per-phase budget and the theoretical floor of each phase on this card are in the
+latter; every later change is judged against it with `STRATA_PREFILL_TIMING=1`.
+
+Results of this campaign, newest last:
+
+- `docs/prefill/v7-round.md` - hyper-connection write-back (an array in local memory),
+  dense MMQ activations quantized straight from FP16, K=640 through dense MMQ, MoE SQ
+- `docs/prefill/v8-round.md` - the N=4 inject kernel, the mix reading the BF16 image,
+  IQ2_S/IQ2_XS through the I=128 tile at J=48, and the candidates that lost
+- `docs/prefill/hc-fuse2.md` - the inject fused into the mix pass
+- `docs/prefill/qsa-value-occupancy.md` - the value kernel's `__launch_bounds__(64, 8)`
+- `docs/prefill/qsa-value-reject.md`, `qsa-dp4a.md`, `qsa-simt.md`, `qsa-select.md` -
+  the QSA experiments that lost, with numbers
+- `docs/prefill/chunk-profile.md` - the chunk size sweep and the per-phase profile
+- `docs/prefill/hc-down-bf16.md`, `hc-pair.md`, `gdn-gemm.md`, `dense-mmq-quality.md` -
+  the earlier prefill adoptions and their quality gates
+- `docs/prefill/prefill-knobs.md` - every prefill env switch and what it needs
+
+External recipes and the machine's limits:
+
+- `docs/references/p40-roofline.md` - per-phase FLOPs, bytes, measured efficiency
+- `docs/references/gap-analysis.md` - cuBLAS/cuBLASLt, CUDA/Pascal, llama.cpp and SASS
+  gap analysis with a prioritised backlog
+- `docs/references/pascal-arch-limits.md`, `pascal-gemv.md`,
+  `cuda-graphs-and-launch.md`, `qwen38-flash-next.md` - architecture and model notes
+- `docs/analysis/prefill-kernel-map.md`, `decode-kernel-map.md`,
+  `optimization-candidates.md` - which kernel runs where
+- `docs/optimization/` - sm_61 defaults, fusion, env sweeps
+
 ## Caveats
 
 - One P40, 98 GiB RAM, SATA-class disk. Results do not transfer unchanged to other
