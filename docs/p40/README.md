@@ -169,3 +169,9 @@ External recipes and the machine's limits:
   gates use parity tests, KL, needle retrieval, and fixed-question accuracy rather
   than exact string equality.
 
+## Measurement harness
+
+`tools/p40/` holds the scripts this campaign measured with: `build-fork.sh`,
+`runPhase.sh`, `runArms.sh`, `verify.sh` and `phaseDiff.py`, with a README that explains
+the one-arm budget, the GPU/build lock protocol and the A/B discipline. They target one
+P40 and the test machine's paths.
