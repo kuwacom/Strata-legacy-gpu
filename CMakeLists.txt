@@ -1421,6 +1421,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     # the hyper-connection read's fused up projection + mix (gr_upmix, STRATA_HC_UPMIX) against cuBLAS + gr_mix_r,
     # bitwise where cuBLAS sums K in the same order, else within FP32 rounding and as close to FP64 (GPU, synthetic,
     # no model; --bench adds timings)
+    # the hyper-connection read's fused inject + mix (gr_mix_r16_inj, STRATA_HC_MIXINJ) against the pair it replaces
+    # (gr_mix_r16 + Gemm::bf16_narrow): `mixed` bitwise, `inj` within FP32 rounding (GPU, synthetic, no model)
+    add_executable(gr_mixinj_parity src/prefill/gr_mixinj_parity.cu)
+    target_link_libraries(gr_mixinj_parity PRIVATE strata_prefill )
+    add_test(NAME gr_mixinj_parity COMMAND gr_mixinj_parity)
+    set_tests_properties(gr_mixinj_parity PROPERTIES SKIP_RETURN_CODE 77)
     add_executable(gr_upmix_parity src/prefill/gr_upmix_parity.cu)
     target_link_libraries(gr_upmix_parity PRIVATE strata_prefill )
     add_test(NAME gr_upmix_parity COMMAND gr_upmix_parity)

@@ -195,6 +195,75 @@ __global__ void gr_mix_r16_kernel(const uint16_t* __restrict__ xn16, int64_t ldx
     }
     if (mixed_h) mixed_h[i] = hf(s);
 }
+// S25 (opt-in STRATA_HC_MIXINJ=1): gr_mix_r16 with the inject projection in the same pass over xn16.  Both read a
+// token's whole BF16 row - the mix its four streams, the inject the same 10,240 values as its K - so one block per token
+// reads it once (20,480 B instead of 40,960) and the inject's 40,960 FMA ride on loads the mix has already made.  Thread
+// tid owns d = tid + 256 m of every stream, so the token's values split into a partition of the threads and each
+// thread's inject partial sums over its own ten columns of the four streams.  `mixed` keeps gr_mix_r16_kernel's bits (c
+// ascending, one fmaf per value); `inj` sums k in another order than bf16_narrow8_kernel, so it is not bitwise that call
+// (no inject path is bitwise the reference either: the 64 x 64 narrow kernel was not).
+constexpr int kMixInjPer = N / 256;   // 1 スレッドが持つ列 (2,560 / 256 = 10)。N は 256 の倍数
+__global__ void __launch_bounds__(256) gr_mix_r16_inj_kernel(const uint16_t* __restrict__ xn16, int64_t ldx,
+                                                             const float* __restrict__ g, const uint16_t* __restrict__ wi,
+                                                             float* __restrict__ mixed, uint16_t* __restrict__ mixed16,
+                                                             uint16_t* __restrict__ mixed_h, uint16_t* __restrict__ mixed16_lo,
+                                                             float* __restrict__ inj, int64_t T) {
+    __shared__ float sh[8 * HC];   // 8 ワープの inject 部分和 (256 スレッド)
+    const int64_t t = blockIdx.x;
+    const int tid = (int) threadIdx.x;
+    const int64_t xrow = t * ldx, grow = t * D;
+    float s[kMixInjPer];
+    float acc[HC];
+#pragma unroll
+    for (int m = 0; m < kMixInjPer; ++m) s[m] = 0.0f;
+#pragma unroll
+    for (int c = 0; c < HC; ++c) acc[c] = 0.0f;
+#pragma unroll
+    for (int c = 0; c < HC; ++c) {   // c 昇順: gr_mix_r16_kernel と同じ和の順 (mixed は bitwise)
+        float x[kMixInjPer];
+#pragma unroll
+        for (int m = 0; m < kMixInjPer; ++m) {
+            const int64_t jx = xrow + c * N + tid + m * 256;
+            x[m] = __uint_as_float((uint32_t) xn16[jx] << 16);   // BF16 -> float はビットの移動だけ
+        }
+        const float* gp = g + grow + c * N + tid;
+#pragma unroll
+        for (int m = 0; m < kMixInjPer; ++m) s[m] = fmaf(x[m], sigm(gp[m * 256]), s[m]);
+        // inject の内積: xn16 の列 k = c * N + d はそのまま wi の k。同じ 10 値を 4 列で使い回す
+#pragma unroll
+        for (int j = 0; j < HC; ++j) {
+            const uint16_t* wp = wi + (int64_t) j * D + c * N + tid;
+#pragma unroll
+            for (int m = 0; m < kMixInjPer; ++m) acc[j] = fmaf(x[m], __uint_as_float((uint32_t) wp[m * 256] << 16), acc[j]);
+        }
+    }
+    float* mp = mixed + t * N + tid;
+#pragma unroll
+    for (int m = 0; m < kMixInjPer; ++m) {
+        s[m] /= (float) HC;
+        mp[m * 256] = s[m];
+        const uint16_t h = act16(s[m]);
+        if (mixed16) {
+            mixed16[t * N + tid + m * 256] = h;
+            if (mixed16_lo) mixed16_lo[t * N + tid + m * 256] = bf_lo(s[m], h);
+        }
+        if (mixed_h) mixed_h[t * N + tid + m * 256] = hf(s[m]);
+    }
+    // inject の block 還元: ワープ内は butterfly、その 8 本を昇順に足す (実行ごとに同じビット)
+    const int lane = tid & 31, w = tid >> 5;
+#pragma unroll
+    for (int j = 0; j < HC; ++j) {
+        const float v = warp_sum(acc[j]);
+        if (lane == 0) sh[w * HC + j] = v;
+    }
+    __syncthreads();
+    if (tid < HC) {
+        float v = sh[tid];
+#pragma unroll
+        for (int i = 1; i < 8; ++i) v += sh[i * HC + tid];
+        inj[t * HC + tid] = v;
+    }
+}
 // F-2: gr_write_kernel for one row (t, c), then gr_norm_rs_kernel's reduction over it with the next half's norm
 // weights - the same thread-to-element mapping (256 threads, stride 256) and block_sum, so rs and the BF16 image are
 // the same bits, and R is not read back
@@ -2868,6 +2937,16 @@ void gr_mix_r16(const uint16_t* xn16, int64_t ldx, const float* gated, float* mi
     gr_mix_r16_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(
         xn16, ldx > 0 ? ldx : D, gated, mixed, mixed16, T, mixed_h, mixed16_lo);
     check("gr_mix_r16");
+}
+bool gr_mix_r16_inj(const uint16_t* xn16, int64_t ldx, const float* gated, const uint16_t* w_inj, float* mixed,
+                    uint16_t* mixed16, uint16_t* mixed_h, uint16_t* mixed16_lo, float* inj, int64_t T, void* stream) {
+    if (T <= 0 || T > (int64_t) (1 << 30) || xn16 == nullptr || gated == nullptr || mixed == nullptr || w_inj == nullptr ||
+        inj == nullptr || ldx < D)
+        return false;
+    gr_mix_r16_inj_kernel<<<(unsigned) T, 256, 0, (cudaStream_t) stream>>>(xn16, ldx, gated, w_inj, mixed, mixed16,
+                                                                          mixed_h, mixed16_lo, inj, T);
+    check("gr_mix_r16_inj");
+    return true;
 }
 bool gr_upmix(const uint16_t* lo16, const uint16_t* w_up, const float* R, const float* rs, const float* w_norm,
               float* mixed, uint16_t* mixed16, uint16_t* mixed_h, int64_t T, void* stream) {

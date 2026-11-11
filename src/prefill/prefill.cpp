@@ -576,6 +576,13 @@ inline bool hc_down_bf16() {
     static const bool v = [] { const char* e = std::getenv("STRATA_HC_DOWN_BF16"); return e != nullptr && e[0] == '1'; }();
     return v;
 }
+// STRATA_HC_MIXINJ=1: inject の射影を gr_mix_r16 の中へ (gr_mix_r16_inj)。どちらも同じハーフで同じ xn16 の行
+// (10,240 値 = 20,480 B) を読んでいたので、1 回の読みで両方を出す。mixed はビット不変、inj は k の和の順だけが
+// 変わる (gr_mixinj_parity)。STRATA_HC_UPMIX とは排他: そちらは up の側で混ぜていて inject の相方が居ない
+inline bool hc_mixinj() {
+    static const bool v = [] { const char* e = std::getenv("STRATA_HC_MIXINJ"); return e && e[0] == '1'; }();
+    return v;
+}
 // STRATA_QSA_FUSE_NR (default on, =0 runs rms_rows + rope [+ split_q] as separate kernels): the QSA layer's K, query and
 // indexer-query norm + rotary in one pass each (strata::prefill::rms_rope_rows; the same bits as the chain it replaces).
 // STRATA_QSA_FUSE_GATE (default on, =0 keeps the separate gate_attn pass): the attention output gate sigmoid(gate) * O in the
@@ -4157,7 +4164,24 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 // inject も同じ xn16 を読む狭い射影 (N = HC = 4) なので、down を narrow で行ったときは
                 // こちらも BF16 のまま読む。従来は FP32 の活性像 (T x K x 4 バイト) を読み直していた
                 bool hinj_narrow = false;
-                if (hcnarrow && !xf16 && m.xn16_lo == nullptr && ldx == D && wi->q8_scale == nullptr &&
+                // STRATA_HC_MIXINJ=1: inject と mix は同じ xn16 の行を 2 回読んでいる。mix のカーネルで inject の
+                // 内積も畳めば、その読み 20,480 B/token-half (全体で 270 GB) が消える。mix と inject の両方が
+                // narrow 経路に乗っているときだけ (upmix は up の側で混ぜているので不可)
+                const bool mixinj = !upmixed && hc_mixinj() && hcnarrow && !xf16 && m.xn16_lo == nullptr && ldx == D &&
+                                    !gr_unfused() && wi->q8_scale == nullptr &&
+                                    wi->kind == core::WeightKind::Bf16InF32 && wi->data != nullptr &&
+                                    wi->ne0 == D && wi->ne1 == HC;
+                if (mixinj) {
+                    const bool ct = g_cold.begin();
+                    // 融合しても順序は inject -> mix: 同じパスで先に inject の内積を畳み、mixed を後段に書く
+                    if (!gr_mix_r16_inj(m.xn16, ldx, m.gated, (const uint16_t*) wi->data, m.mixed, m.mixed_bf,
+                                        m.mixed_h, m.mixed_bf_lo, m.inj, T, m.cs)) {
+                        err = "prefill: STRATA_HC_MIXINJ could not run the hyper-connection inject and mix";
+                        return false;
+                    }
+                    if (ct) g_cold.end("mix_inj", si, T, HC, D);
+                    hinj_narrow = true;
+                } else if (hcnarrow && !xf16 && m.xn16_lo == nullptr && ldx == D && wi->q8_scale == nullptr &&
                     wi->kind == core::WeightKind::Bf16InF32 && wi->data != nullptr && wi->ne0 == D && wi->ne1 == HC) {
                     const bool ct = g_cold.begin();
                     hinj_narrow = m.gemm.bf16_narrow(m.xn16, (const uint16_t*) wi->data, m.inj, T, HC, D, 0, m.cs);
@@ -4165,7 +4189,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 }
                 if (!hinj_narrow && !hcpair && !hcd && !bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err, 0, m.xn16_lo, ldx != D ? ldx : 0, m.cs, xf16)) return false;
                 pt.mark(kPfHcMix, cs);
-                if (upmixed) {
+                if (upmixed || mixinj) {   // mix は up の中 (upmix) か inject との融合カーネルの中で済んでいる
                 } else if (gr_unfused()) {
                     gr_mix(m.xn, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h, m.mixed_bf_lo);
                 } else {
