@@ -171,6 +171,26 @@ function(strata_ggml_tq_overlay LLAMA OUT)
         set(_tq_fail "the DP4A MMQ config has no J=48 CASE for ${_ty}: the I tile 128 is not applied")
       endif()
     endforeach()
+    # IQ2_S / IQ2_XS も I=128 で走らせる（本番の MoE gate/up で最多の型）
+    #  - I=128 の Q8_0_16 タイルは J=64 だと 51,200 B で sm_61 の 49,152 B を 2,048 B 超える。この 41,728 B は
+    #    mmq_get_nbytes_shared_x が I だけで決める値 (tile_x は I x 2 x MMQ_TILE_NE_K を K タイルごとに使い回す) なので、
+    #    K タイル (MMQ_ITER_K / K_vram) を 128 や 192 に落としても 1 B も減らない。J=48 なら 192 + 41,728 + 7,168 = 49,088 B
+    #  - J=64 の行を消すのは switch_J が「列タイル数 ntx が最小の J」を選ぶから。行を残すと I=64/J=64 が選ばれ続け、
+    #    I=128 の行は一度も起動しない (J=48 を選ばせる他の手段が無い)
+    #  - 代償は ntx +33 % (重み tile の再読)、利得は nty 半減 (活性 tile の再読)
+    foreach(_ty IQ2_S IQ2_XS)
+      string(REPLACE "CASE(GGML_TYPE_${_ty}, 256, 2, 64,  48," "CASE(GGML_TYPE_${_ty}, 256, 2, 128,  48," _pd "${_pd}")
+      string(FIND "${_pd}" "CASE(GGML_TYPE_${_ty}, 256, 2, 128,  48," _hit)
+      if(_hit LESS 0)
+        set(_tq_fail "the DP4A MMQ config has no J=48 CASE for ${_ty}: the I tile 128 is not applied")
+      endif()
+      set(_j64 "    CASE(GGML_TYPE_${_ty}, 256, 2, 64,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K, MMQ_ITER_K, false, false);\n")
+      string(FIND "${_pd}" "${_j64}" _hit)
+      if(_hit LESS 0)
+        set(_tq_fail "the DP4A MMQ config has no J=64 CASE for ${_ty}: the I tile 128 at J=48 is never chosen")
+      endif()
+      string(REPLACE "${_j64}" "" _pd "${_pd}")
+    endforeach()
     file(WRITE "${_p}" "${_pd}")
   endif()
 
