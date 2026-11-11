@@ -1,0 +1,180 @@
+name: Fork images
+
+# Builds the container image of THIS fork from source and pushes it to ghcr.io.
+#
+# The upstream "Docker images" workflow cannot be reused here: it downloads the engine package of a release and checks
+# it against niko1221's signed update feed. The fork has no releases, so this one compiles the engine in the CUDA devel
+# container (nvcc needs no GPU) and then builds the image around it with docker/build.sh.
+#
+# Published tags (IMAGE = ghcr.io/kuwacom/strata-legacy-gpu):
+#   cuda12                  the architecture list below, the fork's improvements (Pascal..Blackwell in one image)
+#   <version>-cuda12        the same, pinned to the CMake project version
+#   sha-<short commit>      the same, pinned to the commit
+#   edge                    the same, only from a push to main (this is the "whatever main is now" tag)
+#
+# Triggers
+#   - Actions tab -> Fork images -> Run workflow (archs, tag and push are inputs; push off = build only, no publish)
+#   - a tag push v* publishes <version>-cuda12 and moves :cuda12
+#   - a push to main that touches the engine publishes :edge (and :sha-...); set "paths" below to widen or narrow it
+# A build compiles every listed architecture, so it takes hours on a 4-core runner: the default list is the five that
+# matter (61 = P40/P4, 75 = T4, 86 = RTX 30, 89 = RTX 40, 120 = RTX 50). Add 60 (P100) or 70 (V100) with the archs
+# input when you need them; every extra architecture is roughly a fifth more compile time.
+
+on:
+  workflow_dispatch:
+    inputs:
+      archs:
+        description: 'CMAKE_CUDA_ARCHITECTURES for the engine'
+        required: false
+        default: '61-real;75-real;86-real;89-real;120'
+        type: string
+      tag:
+        description: 'Image tag to publish (empty: <version>-cuda12, and :cuda12 when latest is on)'
+        required: false
+        default: ''
+        type: string
+      push:
+        description: 'Push to ghcr.io (off: build only, nothing is published)'
+        required: true
+        default: true
+        type: boolean
+      latest:
+        description: 'Also move the :cuda12 tag'
+        required: true
+        default: false
+        type: boolean
+  push:
+    tags:
+      - 'v*'
+    branches:
+      - main
+    paths:
+      - 'src/**'
+      - 'include/**'
+      - 'cmake/**'
+      - 'CMakeLists.txt'
+      - 'packaging/**'
+      - 'docker/**'
+      - 'scripts/ci-build-engine.sh'
+      - 'requirements-build.txt'
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: fork-images-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/kuwacom/strata-legacy-gpu
+  CUDA_DEVEL: nvidia/cuda:12.9.1-devel-ubuntu24.04
+
+jobs:
+  image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space (the runner has about 14 GB; the devel image, the build and the image need about 20 GB)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          docker system prune -af >/dev/null 2>&1 || true
+          df -h /
+
+      - name: Resolve the tag and the architectures
+        id: vars
+        env:
+          IN_ARCHS: ${{ inputs.archs }}
+          IN_TAG: ${{ inputs.tag }}
+          REF: ${{ github.ref }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -eu
+          version=$(sed -n 's/^[[:space:]]*project([^)]*VERSION[[:space:]]*\([0-9][0-9.]*\).*/\1/p' CMakeLists.txt | head -1)
+          version=${version:-dev}
+          archs=${IN_ARCHS:-61-real;75-real;86-real;89-real;120}
+          latest=false
+          case "$EVENT" in
+            workflow_dispatch)
+              tag=${IN_TAG:-$version-cuda12}
+              latest=${{ inputs.latest }} ;;
+            push)
+              if [ "$(printf '%s' "$REF" | cut -c1-11)" = "refs/tags/v" ]; then
+                tag=$version-cuda12          # a release tag names the version, not the ref
+                latest=true
+              else
+                tag=edge
+                latest=false
+              fi ;;
+            *) tag=$version-cuda12 ;;
+          esac
+          short=$(printf '%s' "${{ github.sha }}" | cut -c1-12)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "archs=$archs" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "sha_tag=sha-$short" >> "$GITHUB_OUTPUT"
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Fork image"
+            echo "- tag: \`$tag\`, sha: \`sha-$short\`, archs: \`$archs\`"
+            echo "- push: \`${{ inputs.push }}\` (a tag push or main always publishes)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build the engine from source (no GPU needed)
+        env:
+          ARCHS: ${{ steps.vars.outputs.archs }}
+          VARIANT: cuda12
+        run: |
+          set -eu
+          mkdir -p engine
+          docker run --rm \
+            -v "$PWD":/work/strata -v "$PWD/engine":/work/engine -w /work/strata \
+            -e ARCHS="$ARCHS" -e VARIANT="$VARIANT" -e LABEL=ci \
+            "$CUDA_DEVEL" sh scripts/ci-build-engine.sh
+
+      - name: Build the image
+        env:
+          VERSION: ${{ steps.vars.outputs.version }}
+          TAG: ${{ steps.vars.outputs.tag }}
+        run: |
+          set -eu
+          eng=$(ls -d engine/*/ | head -1)
+          sudo env STRATA_BUILD_COMMIT="${{ github.sha }}" \
+            docker/build.sh --flavor cuda --engine "${eng%/}" --tag "strata:ci-$VERSION-cuda12" --version "$VERSION"
+          docker tag "strata:ci-$VERSION-cuda12" "$IMAGE:$TAG"
+          docker tag "strata:ci-$VERSION-cuda12" "$IMAGE:${{ steps.vars.outputs.sha_tag }}"
+          if [ "${{ steps.vars.outputs.latest }}" = "true" ]; then docker tag "strata:ci-$VERSION-cuda12" "$IMAGE:cuda12"; fi
+          docker images | grep -E "$IMAGE|strata:ci" || true
+
+      - name: Log in to ghcr.io
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.push }}
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Push
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.push }}
+        env:
+          TAG: ${{ steps.vars.outputs.tag }}
+          SHA_TAG: ${{ steps.vars.outputs.sha_tag }}
+          LATEST: ${{ steps.vars.outputs.latest }}
+        run: |
+          set -eu
+          docker push "$IMAGE:$TAG"
+          docker push "$IMAGE:$SHA_TAG"
+          if [ "$LATEST" = "true" ]; then docker push "$IMAGE:cuda12"; fi
+          {
+            echo "### Published"
+            echo "- \`$IMAGE:$TAG\`"
+            echo "- \`$IMAGE:$SHA_TAG\`"
+            if [ "$LATEST" = "true" ]; then echo "- \`$IMAGE:cuda12\`"; fi
+            echo ""
+            echo "Pull it with: \`docker pull $IMAGE:$TAG\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the package public if it already is
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.push }}
+        continue-on-error: true
+        run: echo "If the package is private, make it public once in the package settings on GitHub (Packages -> strata-legacy-gpu -> Change visibility)."

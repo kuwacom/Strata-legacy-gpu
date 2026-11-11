@@ -13,6 +13,35 @@ It is under the **Qwen Research License**, not Apache 2.0. Read
 [its license](https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo/blob/main/LICENSE) before you use the images
 commercially.
 
+## This fork's images
+
+The upstream images (`ghcr.io/niko1221/strata:<version>-cuda12`) are built from an upstream release and do not carry
+this fork's prefill work. The fork publishes its own, built from this tree:
+
+| image | what it is |
+|---|---|
+| `ghcr.io/kuwacom/strata-legacy-gpu:cuda12` | the fork's engine for sm_61 (P40/P4), 75 (T4), 86 (RTX 30), 89 (RTX 40) and 120 (RTX 50) in one image |
+| `ghcr.io/kuwacom/strata-legacy-gpu:<version>-cuda12` | the same, pinned to the CMake project version (0.1.57 built the 0.2.11 terminal) |
+| `ghcr.io/kuwacom/strata-legacy-gpu:sha-<commit>` | the same, pinned to a commit |
+| `ghcr.io/kuwacom/strata-legacy-gpu:edge` | what `main` was the last time the engine sources changed |
+
+They are built by `.github/workflows/fork-images.yml`, which compiles the engine from source in
+`nvidia/cuda:12.9.1-devel-ubuntu24.04` (nvcc needs no GPU) with `scripts/ci-build-engine.sh` and then wraps it with
+`docker/build.sh`. The workflow runs
+
+- from the Actions tab (**Fork images** -> Run workflow), with `archs`, `tag`, `push` and `latest` inputs; `push` off is
+  a dry run that leaves the image on the runner only,
+- on a `v*` tag push, publishing `<version>-cuda12` and moving `:cuda12`,
+- on a push to `main` that touches `src/`, `include/`, `cmake/`, `CMakeLists.txt`, `packaging/`, `docker/` or
+  `scripts/ci-build-engine.sh`, publishing `:edge` and `:sha-<commit>`.
+
+Every build compiles each listed architecture, so it runs for a couple of hours: the default list is the five that
+matter, and `archs` adds 60 (P100) or 70 (V100) when needed. The package is private on GHCR until it is made public
+once in the package settings.
+
+To pin the P40 numbers in this repository's docs, use the same image tag the measurements were made with
+(`strata:fork-v9` locally, engine 0.1.57); the fork image above is that engine built portably for several cards.
+
 ## Quick start
 
 ```sh
