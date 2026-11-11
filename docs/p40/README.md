@@ -11,7 +11,7 @@ The 5% threshold is used for adoption unless a change is bitwise and reproducibl
 ## Result
 
 Compared with the previous production image (`0.2.7`, engine 0.1.52), the final
-configuration (`fork-v8`, engine 0.1.57) gives:
+configuration (`fork-v9`, engine 0.1.57) gives:
 
 | Metric | Before | After | Change |
 |---|---:|---:|---:|
@@ -77,6 +77,7 @@ cells stay in VRAM. RoPE scaling is YaRN with factor 2.
 | `STRATA_HC_INJ8=1`: an 8-token kernel for the N=4 inject projection (one warp, 8 tokens, weight reused 8 times) | `hc read: inject` 2,756 -> 897 ms (-67%); 128K prefill +1.0% | `gemm_bf16_parity` 0 failures; 98 -> 301 GB/s |
 | `STRATA_HC_MIX16=1`: the hyper-connection mix reads the BF16 image instead of `R` | `hc read: mix` 4,525 -> 3,630 ms (-20%); 128K prefill +0.5% | Not bitwise (BF16 rounding, rel RMS 9.3e-4); needle 3/3, QA 8/8 |
 | IQ2_S / IQ2_XS through the I=128 MMQ tile at J=48 (the J=64 row is dropped so it is chosen) | `gemm gate/up` -5.4%; 128K prefill +0.7% | Same per-output sums; parity screen and needle/QA passed |
+| `STRATA_HC_MIXINJ=1`: the N=4 inject dot rides on the mix pass that already reads the same `xn16` | inject+mix 4,527 -> 4,040 ms (-11%) | `gr_mixinj_parity` 0 failures (`mixed` bit-identical); needle/QA passed |
 
 ## Changes that were rejected
 
