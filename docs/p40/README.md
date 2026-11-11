@@ -11,14 +11,14 @@ The 5% threshold is used for adoption unless a change is bitwise and reproducibl
 ## Result
 
 Compared with the previous production image (`0.2.7`, engine 0.1.52), the final
-configuration (`fork-v7`, engine 0.1.57) gives:
+configuration (`fork-v8`, engine 0.1.57) gives:
 
 | Metric | Before | After | Change |
 |---|---:|---:|---:|
-| prefill 24K (tok/s) | 485 | 732 | **+51%** |
-| prefill 128K (tok/s) | 434 | 740 | **+71%** |
-| TTFT 24K (s) | 57.9 | 33.7 | **-42%** |
-| TTFT 128K (s) | 278.0 | 185.5 | **-33%** |
+| prefill 24K (tok/s) | 485 | 734 | **+51%** |
+| prefill 128K (tok/s) | 434 | 758 | **+75%** |
+| TTFT 24K (s) | 57.9 | 33.6 | **-42%** |
+| TTFT 128K (s) | 278.0 | 181.2 | **-35%** |
 | TTFT 480K (s) | ~1,532 | 837.4 (fork-v3) | **-45%** |
 | prefill 480K (tok/s) | ~303 | 561.6 (fork-v3) | **+85%** |
 | decode 4K code / prose (tok/s) | 52.3 / 43.3 | 44.1-51.9 / 41.3-43.4 | no change |
@@ -74,6 +74,9 @@ cells stay in VRAM. RoPE scaling is YaRN with factor 2.
 | Dense MMQ activations quantized straight from FP16 | 128K prefill +1.3%; `gdn out proj` -7.6%, `router+shared` -10.3% | Bitwise; removes an f16->f32->q8_1 round trip of T x K per launch |
 | Shared expert down projection (K=640) through dense MMQ | `router+shared` -15.1%; 128K prefill +1.2% | Not bitwise (activations rounded to int8); needle 24K/32K/128K and QA 8/8 passed |
 | `STRATA_MMQ_SQ=1` (SwiGLU and the down product's q8_1 in one pass) | `gemm gate/up` -4.2%; 128K prefill +0.7% | `prefill_swiglu_quant_test` ok |
+| `STRATA_HC_INJ8=1`: an 8-token kernel for the N=4 inject projection (one warp, 8 tokens, weight reused 8 times) | `hc read: inject` 2,756 -> 897 ms (-67%); 128K prefill +1.0% | `gemm_bf16_parity` 0 failures; 98 -> 301 GB/s |
+| `STRATA_HC_MIX16=1`: the hyper-connection mix reads the BF16 image instead of `R` | `hc read: mix` 4,525 -> 3,630 ms (-20%); 128K prefill +0.5% | Not bitwise (BF16 rounding, rel RMS 9.3e-4); needle 3/3, QA 8/8 |
+| IQ2_S / IQ2_XS through the I=128 MMQ tile at J=48 (the J=64 row is dropped so it is chosen) | `gemm gate/up` -5.4%; 128K prefill +0.7% | Same per-output sums; parity screen and needle/QA passed |
 
 ## Changes that were rejected
 
