@@ -3,7 +3,7 @@
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/core/arch_defaults.hpp"   // prompt_f16_resolve (inline)
 #include "strata/core/emulate.hpp"
-#if defined(STRATA_PREFILL_MMQ) && defined(__HIPCC__)
+#if defined(STRATA_PREFILL_MMQ)
 #include "strata/prefill/mmq_ids_margin.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 #endif
@@ -750,7 +750,7 @@ Gemm::~Gemm() {
     for (void* e : side_free_)
         if (e) (void) cudaEventDestroy((cudaEvent_t) e);
     if (side_stream_) (void) cudaStreamDestroy((cudaStream_t) side_stream_);
-#if defined(STRATA_PREFILL_MMQ) && defined(__HIPCC__)
+#if defined(STRATA_PREFILL_MMQ)   // (CUDA の dense MMQ も Context を持つので同じ条件で解放する)
     delete static_cast<strata::prefill::mmq::Context*>(mmq_ctx_);
     if (mmq_buf_) cudaFree(mmq_buf_);
 #endif
@@ -1567,7 +1567,10 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
     STRATA_ABSORB_HIPBLAS_STICKY("cublasGemmEx f16");
 }
 
-#if defined(STRATA_PREFILL_MMQ) && defined(__HIPCC__)
+// 段 1: v0.2.15 は dense MMQ を HIP だけでコンパイルしていた (&& defined(__HIPCC__))。STRATA_MMQ=ON の CUDA でも
+// 同じ int8 経路を使えるようガードを外す。実行時に有効化するのは従来どおり STRATA_DENSE_MMQ=1 だけで、既定は off
+// (段 2 の測定は STRATA_MMQ=ON + STRATA_DENSE_MMQ=1 で別に取る)。
+#if defined(STRATA_PREFILL_MMQ)
 bool Gemm::native_mmq(const uint16_t* X, int type, const void* W, float* Y, int64_t T, int64_t N, int64_t K,
                       int64_t ldy) {
     namespace mmq = strata::prefill::mmq;
@@ -1713,7 +1716,7 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
                              "copied unpadded (no device memory)\n", (long long) ldx, (long long) K);
         std::exit(1);
     }
-#if defined(STRATA_PREFILL_MMQ) && defined(__HIPCC__)
+#if defined(STRATA_PREFILL_MMQ)
     if (beta == 0.0f && (ldx == 0 || ldx == K) && native_mmq(X, ggml_type, W_blocks, Y, T, N, K, ldy)) return;
 #endif
 #if !defined(__HIPCC__)

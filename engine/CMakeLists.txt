@@ -104,6 +104,14 @@ endif()
 option(STRATA_ENABLE_HIP "Build the HIP targets for wave32 AMD GPUs (gfx1100, gfx1201; gfx1012/gfx1030 unvalidated)" OFF)
 # llama.cpp's MMQ prompt kernels are no longer in the tree (0.2.16): every CUDA and HIP build compiles Strata's own prompt kernels (strata_pf_own)
 # and the FP16 path.  MMQ comparison builds come from the v0.2.15 tag.
+# 段 1 (perf/mmq-revival): -DSTRATA_MMQ=ON で v0.2.15 の CUDA 構成 (strata_mmq = routed expert の MMQ) を戻せる。既定 off は
+# 0.2.21 と同じビルド構成 (strata_pf_own + FP16 経路) で、段ごとの測定を混ぜないため CUDA だけの opt-in にしてある
+option(STRATA_MMQ "Build llama.cpp's MMQ prompt kernels for the routed experts (CUDA; the v0.2.15 path)" OFF)
+# 段 2 (dense / K-quant): strata_kq と Q4_K / Q5_K / Q5_1 / Q6_K のインスタンス。既定 off (段 1 の測定に混ぜない)
+option(STRATA_MMQ_KQUANTS "Build the MMQ prompt kernels for Q4_K / Q5_K / Q5_1 / Q6_K (strata_kq; stage 2)" OFF)
+if(STRATA_MMQ AND (STRATA_ENABLE_HIP OR STRATA_HIP_GFX906))
+  message(FATAL_ERROR "STRATA_MMQ is the CUDA path here (the HIP MMQ port is not part of this tree)")
+endif()
 # The community-made AMD changes (include/strata/core/amd_community.hpp): on by default.  This option is the build half of the one
 # switch STRATA_AMD_COMMUNITY_TUNING: OFF compiles the portable signed-byte dot for gfx1010 again (the SDWA sequence of #4855).
 # The rocBLAS tables are switched at run time (STRATA_AMD_COMMUNITY_TUNING=0).
@@ -722,11 +730,16 @@ strata_cpu_kernels()
 # third_party/strata-ggml (frozen at the llama.cpp commit in third_party/ggml/VERSION.txt, see its UPSTREAM.md): no download.
 # -DSTRATA_GGML_DIR=<llama.cpp checkout> still builds from that checkout instead (an override kept for two releases).
 strata_ggml_resolve("${CMAKE_CURRENT_SOURCE_DIR}")
+# strata_mmq (STRATA_MMQ=ON) は型テーブルに ggml-base を使う (v0.2.15 と同じ)。ggml を configure しないビルドでは積めない
+if(STRATA_MMQ AND NOT STRATA_NATIVE_EXPERTS)
+  message(FATAL_ERROR "STRATA_MMQ requires STRATA_NATIVE_EXPERTS=ON (moe_mmq.cu reads ggml's type table)")
+endif()
 if(STRATA_NATIVE_EXPERTS)
   enable_language(C)
   # ggml-base / ggml-cpu only where something links them: the tests (ggml as the oracle) and the ggml-cpu pool (STRATA_OWN_CPU_QUANT=OFF).
   # A release engine (tests off, Strata's own pool) configures, builds and links no ggml; the ggml tools below exist only with it.
-  if(STRATA_BUILD_TESTS OR NOT STRATA_OWN_CPU_QUANT)
+  # (STRATA_MMQ=ON は strata_mmq が ggml-base をリンクするので、この場合も configure する)
+  if(STRATA_BUILD_TESTS OR NOT STRATA_OWN_CPU_QUANT OR STRATA_MMQ)
     strata_ggml_configure_root()
   else()
     set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)   # (what strata_ggml_configure_root sets for the whole project)
@@ -734,7 +747,9 @@ if(STRATA_NATIVE_EXPERTS)
   endif()
   strata_cpu_native_experts()
   strata_quant_layer()
-  if(STRATA_ENABLE_CUDA)
+  if(STRATA_ENABLE_CUDA AND STRATA_MMQ)
+    strata_cuda_mmq()      # llama.cpp の MMQ (v0.2.15 の構成) + Strata 自身のプロンプトカーネル
+  elseif(STRATA_ENABLE_CUDA)
     strata_cuda_pf_own()   # Strata's own prompt kernels
   elseif(STRATA_ENABLE_HIP)
     strata_hip_pf_own()

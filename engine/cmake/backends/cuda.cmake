@@ -1,4 +1,5 @@
 # cmake/backends/cuda.cmake - the NVIDIA (CUDA) parts of the root project: toolchain setup, Strata's prompt kernels (strata_pf_own), their tests, the spill guard.
+# (STRATA_MMQ=ON: llama.cpp's MMQ prompt kernels for the routed experts, strata_mmq / strata_kq, bring the v0.2.15 path back; off by default)
 #
 # Every block below is a macro: it runs in the scope of the caller (CMakeLists.txt calls it where the block used to be), so variables, targets and
 # their order are those of the single-file CMakeLists.txt it was cut from (cleanup 5.4; the build graph is identical).
@@ -94,6 +95,7 @@ endmacro()
 # Strata's own prompt kernels (strata_pf_own, with mmq_absent.cpp for the MMQ half of moe_mmq.hpp; llama.cpp's MMQ left the tree in 0.2.16).
 # No ggml: the type ids are Strata's table (strata/quant/types.hpp),
 # the block layouts the quant header in third_party/ggml
+# (STRATA_MMQ=ON: 下の strata_cuda_mmq が MMQ 本物を積むので mmq_absent.cpp はこのライブラリから外れる)
 macro(strata_cuda_pf_own)
     set(_strata_gg ${_strata_ggml_root}/ggml)   # (the tests' include path)
     # Clean-room MIT Blackwell mxf4nvf4 prompt-expert kernels (moe_fp4_tc.cu), compiled in their own static target with
@@ -132,8 +134,15 @@ macro(strata_cuda_pf_own)
     target_include_directories(strata_pf_fp4 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_link_libraries(strata_pf_fp4 PUBLIC strata_quant ${_strata_gpu_runtime_target})
     target_link_libraries(strata_kernels PUBLIC strata_pf_fp4)
+    # STRATA_MMQ=ON: mmq:: の実装は strata_mmq (llama.cpp の MMQ) が持つので、MMQ 半分のスタブは入れない
+    # (入れると mmq::built などが二重定義になる)。OFF の既定は 0.2.21 と同じソース構成のまま
+    if(STRATA_MMQ)
+      set(_strata_pf_own_absent "")
+    else()
+      set(_strata_pf_own_absent src/prefill/mmq_absent.cpp)
+    endif()
     add_library(strata_pf_own STATIC src/prefill/moe_fused.cu src/prefill/moe_fused_iq.cu src/prefill/moe_helpers.cu
-                src/prefill/moe_fused_iq_q36.cu src/prefill/mmq_absent.cpp)
+                src/prefill/moe_fused_iq_q36.cu ${_strata_pf_own_absent})
     target_include_directories(strata_pf_own PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_compile_options(strata_pf_own PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda -use_fast_math>)
     if(MSVC)
@@ -154,10 +163,76 @@ macro(strata_cuda_pf_own)
     message(STATUS "Strata: Strata's own prompt kernels and the FP16 path")
 endmacro()
 
+# strata_mmq: llama.cpp's MMQ prompt kernels for the prompt path's routed experts (gate/up and down), -DSTRATA_MMQ=ON.
+# 段 1 (perf/mmq-revival): v0.2.15 の構成の復元。既定 (OFF) では何も変えず、0.2.21 と同じく strata_pf_own と FP16 経路だけ。
+# llama.cpp 側のソースは third_party/strata-llama (vision テストの oracle として ggml-cuda を全量持つ木) から取る。
+macro(strata_cuda_mmq)
+    strata_cuda_pf_own()   # Strata 自身のプロンプトカーネル (STRATA_MMQ=ON では mmq_absent.cpp 抜き)
+    # v0.2.15 と同じ 9 型のインスタンスだけを積む: routed expert の gate/up と down が使う型。
+    # K-quant (q4_k q5_k q5_1 q6_k) は dense 側 = 段 2 なので、STRATA_MMQ_KQUANTS (既定 off) のときだけ
+    set(_strata_mmq_types q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0)
+    set(_strata_kq_types q4_k q5_k q5_1 q6_k)
+    # 既定の third_party/strata-ggml は 0.2.16 に ggml-cuda を落としているので、ここだけ strata-llama を指す。
+    # mmq.cuh は v0.2.15 の vendored 版と sha256 一致、ggml.h / ggml-common.h も strata-ggml と同一バイトなので
+    # ggml-base (strata-ggml からビルド) と型・ABI が揃う
+    set(_strata_mmq_llama ${CMAKE_CURRENT_SOURCE_DIR}/third_party/strata-llama/ggml)
+    set(_strata_mmq ${_strata_mmq_llama}/src/ggml-cuda)
+    add_library(strata_mmq STATIC src/prefill/moe_mmq.cu src/prefill/ggml_cuda_host.cu ${_strata_mmq}/quantize.cu)
+    foreach(_t IN LISTS _strata_mmq_types)
+      target_sources(strata_mmq PRIVATE ${_strata_mmq}/template-instances/mmq-instance-${_t}.cu)
+    endforeach()
+    target_include_directories(strata_mmq PRIVATE ${_strata_mmq_llama}/include ${_strata_mmq_llama}/src ${_strata_mmq}
+                               PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_options(strata_mmq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda -use_fast_math>)
+    if(MSVC)
+      target_compile_options(strata_mmq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/bigobj>)
+    endif()
+    # ggml-base: moe_mmq.cu が型テーブル (ggml_blck_size / ggml_type_size / ggml_type_name) を引くため
+    target_link_libraries(strata_mmq PUBLIC ggml-base ${_strata_gpu_runtime_target})
+    if(TARGET CUDA::cuda_driver)
+      target_link_libraries(strata_mmq PUBLIC CUDA::cuda_driver)
+    endif()
+    if(STRATA_MMQ_KQUANTS)
+      # 段 2 (dense / K-quant)。既定 off: 段 1 の測定に dense を混ぜないため。v0.2.15 と同じく別ライブラリ strata_kq に
+      # し、K-quant expert のモデルだけが起動時に読み込む (エンジンは EAGER で全カーネルを読むので VRAM を節約する)
+      target_compile_definitions(strata_mmq PRIVATE STRATA_MMQ_KQUANTS=1 STRATA_KQ_DSO=1)
+      target_sources(strata_mmq PRIVATE src/prefill/mmq_kq_loader.cpp)
+      if(NOT WIN32)
+        target_link_libraries(strata_mmq PUBLIC ${CMAKE_DL_LIBS})
+      endif()
+      add_library(strata_kq SHARED src/prefill/mmq_kq_lib.cu src/prefill/ggml_cuda_host.cu)
+      foreach(_t IN LISTS _strata_kq_types)
+        target_sources(strata_kq PRIVATE ${_strata_mmq}/template-instances/mmq-instance-${_t}.cu)
+      endforeach()
+      target_include_directories(strata_kq PRIVATE ${_strata_mmq_llama}/include ${_strata_mmq_llama}/src ${_strata_mmq}
+                                 ${CMAKE_CURRENT_SOURCE_DIR}/include)
+      target_compile_options(strata_kq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda -use_fast_math>)
+      if(MSVC)
+        target_compile_options(strata_kq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/bigobj>)
+      endif()
+      set_target_properties(strata_kq PROPERTIES CUDA_RUNTIME_LIBRARY Static POSITION_INDEPENDENT_CODE ON
+                            CXX_VISIBILITY_PRESET hidden CUDA_VISIBILITY_PRESET hidden)
+      # ggml-base is static: position-independent so a shared library can hold it (the same code otherwise)
+      set_target_properties(ggml-base PROPERTIES POSITION_INDEPENDENT_CODE ON)
+      target_link_libraries(strata_kq PRIVATE ggml-base)
+      if(TARGET CUDA::cuda_driver)
+        target_link_libraries(strata_kq PRIVATE CUDA::cuda_driver)
+      endif()
+      add_dependencies(strata_mmq strata_kq)
+    endif()
+    target_link_libraries(strata_mmq PUBLIC strata_pf_own)
+    target_link_libraries(strata_prefill PUBLIC strata_mmq)
+    # prefill.cpp の MMQ 分岐 (STRATA_PF_OWN_ONLY を外し、expert を MMQ で回す) はこの定義で戻る
+    target_compile_definitions(strata_prefill PUBLIC STRATA_PREFILL_MMQ=1)
+    set(_strata_pf_tests_lib strata_mmq)
+    message(STATUS "Strata: llama.cpp's MMQ prompt kernels (STRATA_MMQ=ON): routed experts on ${_strata_mmq_types}")
+endmacro()
+
 # the prompt kernels' tests: the fused experts' (linked to ${_strata_pf_tests_lib})
 macro(strata_cuda_prompt_tests)
-    if(STRATA_BUILD_TESTS)
+    if(STRATA_BUILD_TESTS AND NOT STRATA_MMQ)
       # P4-SPLIT: the engine and Strata's prompt library hold none of llama.cpp's MMQ (names in the bytes, nm, cuobjdump; tools/check_no_mmq.py)
+      # (STRATA_MMQ=ON のビルドは MMQ を積むのが正なので、このテストは OFF のときだけ登録する)
       # The cuobjdump look is named, so a device look that did not run fails the test (exit 3, "NOT RUN (<why>)" in its output).  Each tool
       # gets 600 s (--tool-timeout), under the test's own limit: a slow cuobjdump ends as a named NOT RUN, not as a test killed with no line.
       find_package(Python3 QUIET COMPONENTS Interpreter)
@@ -294,7 +369,7 @@ if(STRATA_ENABLE_CUDA AND STRATA_BUILD_TESTS AND NOT STRATA_ENABLE_HIP AND NOT S
   find_package(Python3 QUIET COMPONENTS Interpreter)
   if(Python3_Interpreter_FOUND)
     set(_strata_spill_libs)
-    foreach(_t strata_kernels strata_core strata_engine strata_prefill strata_qwen35 strata_pf_own strata_pf_fp4)
+    foreach(_t strata_kernels strata_core strata_engine strata_prefill strata_qwen35 strata_pf_own strata_pf_fp4 strata_mmq strata_kq)
       if(TARGET ${_t})
         list(APPEND _strata_spill_libs $<TARGET_FILE:${_t}>)
       endif()
