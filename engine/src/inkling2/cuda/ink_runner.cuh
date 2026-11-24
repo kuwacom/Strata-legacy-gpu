@@ -1967,6 +1967,8 @@ struct InkCudaRunner {
                     prof_ms[4] / iters, prof_ms[5] / iters, prof_ms[7] / iters);
         std::fprintf(stderr, "[PROF moe parts / %d iters] (the moe= above is what is left after these) router+topk=%.2f bin=%.2f gu(sf4/mx8/sk)=%.2f dn(sf4/mx8/sk)=%.2f gu(gguf)=%.2f dn(gguf)=%.2f ms/step\n",
                     iters, prof_ms[8] / iters, prof_ms[9] / iters, prof_ms[10] / iters, prof_ms[11] / iters, prof_ms[12] / iters, prof_ms[13] / iters);
+        std::fprintf(stderr, "[PROF moe sk parts / %d iters] gu(sk)=%.2f dn(sk)=%.2f ms/step (each window includes the q8_1 quant of its input)\n",
+                    iters, prof_ms[14] / iters, prof_ms[15] / iters);
     }
 
     static size_t kv_bytes_per_visit_pos(InkKvDtype dt) noexcept {
