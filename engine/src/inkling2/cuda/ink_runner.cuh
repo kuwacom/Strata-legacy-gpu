@@ -1821,6 +1821,11 @@ struct InkCudaRunner {
     __nv_bfloat16 *d_pf_q = nullptr, *d_pf_k = nullptr, *d_pf_v = nullptr, *d_pf_p = nullptr;  // TC prefill attention
     float *d_pf_s = nullptr, *d_pf_o = nullptr, *d_pf_ot = nullptr, *d_pf_m = nullptr, *d_pf_l = nullptr;
     int pf_kv_cap = 0;
+    // 上の 4 本は BF16 型で宣言しているが、sm_61 では中身が FP32 になる (cudaMalloc は byte 数で取るだけ)。
+    // 読み書きする側はこの要素サイズでアドレスを進める
+    int pf_elem_cap = 0;          // d_pf_q/k/v/p の 1 要素のバイト数 (2 = BF16/FP16, 4 = FP32)
+    bool pf_tile_enabled = true;  // STRATA_INK_PF_TILE=0: タイル型 prefill attention を止めて per-token 経路に戻す
+    bool pf_tile_warned = false;  // フォールバックのログは 1 回だけ出す
     float *d_stage_k = nullptr, *d_stage_v = nullptr, *d_stage_sconv = nullptr;  // Tree-16 verify staging
     InkKvVisitDesc* d_kv_desc_arr = nullptr;
     float** d_sconv_pool_arr = nullptr;
@@ -1876,6 +1881,7 @@ struct InkCudaRunner {
         __nv_bfloat16 *d_pf_q = nullptr, *d_pf_k = nullptr, *d_pf_v = nullptr, *d_pf_p = nullptr;
         float *d_pf_s = nullptr, *d_pf_o = nullptr, *d_pf_ot = nullptr, *d_pf_m = nullptr, *d_pf_l = nullptr;
         int pf_kv_cap = 0;
+        int pf_elem_cap = 0;
         __nv_bfloat16 *d_x_bf16 = nullptr, *d_w_scratch = nullptr;
         int32_t *d_slots = nullptr, *d_pos = nullptr;
         InkMoeWorkspace ws;
@@ -1978,6 +1984,7 @@ struct InkCudaRunner {
         ls_stages[cur_stage].d_pf_s = d_pf_s; ls_stages[cur_stage].d_pf_o = d_pf_o;
         ls_stages[cur_stage].d_pf_ot = d_pf_ot; ls_stages[cur_stage].d_pf_m = d_pf_m;
         ls_stages[cur_stage].d_pf_l = d_pf_l; ls_stages[cur_stage].pf_kv_cap = pf_kv_cap;
+        ls_stages[cur_stage].pf_elem_cap = pf_elem_cap;
         cur_stage = s;
         INK_CK(cudaSetDevice(m.stage_gpu[s]));
         StageExec& se = ls_stages[s];
@@ -1995,7 +2002,7 @@ struct InkCudaRunner {
         d_attn_pm = se.d_attn_pm; d_attn_pl = se.d_attn_pl; d_attn_po = se.d_attn_po;
         d_pf_q = se.d_pf_q; d_pf_k = se.d_pf_k; d_pf_v = se.d_pf_v; d_pf_p = se.d_pf_p;
         d_pf_s = se.d_pf_s; d_pf_o = se.d_pf_o; d_pf_ot = se.d_pf_ot; d_pf_m = se.d_pf_m; d_pf_l = se.d_pf_l;
-        pf_kv_cap = se.pf_kv_cap;
+        pf_kv_cap = se.pf_kv_cap; pf_elem_cap = se.pf_elem_cap;
         d_x_bf16 = se.d_x_bf16; d_w_scratch = se.d_w_scratch;
         d_slots = se.d_slots; d_pos = se.d_pos;
         cur_moe_ws = (s == 0) ? &moe_ws : &se.ws;
@@ -2107,6 +2114,8 @@ struct InkCudaRunner {
                 INK_CK(cudaMemset(d_dbg_hash, 0, (size_t)16 * kDbgSlots * 8));
             }
         }
+        // 安全弁: STRATA_INK_PF_TILE=0 でタイル型 prefill attention を止め、従来の per-token 経路 (k_ink_flash_gqa_gqa3) に戻す
+        if (const char* pt = std::getenv("STRATA_INK_PF_TILE"); pt && pt[0] == '0') pf_tile_enabled = false;
         INK_CK(cudaStreamCreate(&st));
         INK_CK(cudaEventCreate(&ev_p0));
         INK_CK(cudaEventCreate(&ev_p1));
@@ -2354,10 +2363,10 @@ struct InkCudaRunner {
 
         moe_ws.alloc(max_batch);
         // Pre-allocate O(1)-VRAM Tensor Core prefill attention workspace (~114 MiB fixed forever!)
-        if (m.sm_cc >= 60 && max_slots <= 4 && max_batch >= 128) {
+        if (pf_tile_enabled && m.sm_cc >= 60 && max_slots <= 4 && max_batch >= 128) {
             size_t vf = 0, vt = 0;
             INK_CK(ink_cuda_mem_info(&vf, &vt, m.primary_gpu));
-            if (vf > (320ull << 20)) ensure_pf_attn(kInkPfKvTile);
+            if (vf > (320ull << 20)) ensure_pf_attn(kInkPfKvTile, pf_elem_for_cc(m.sm_cc));
         }
 
         if (m.ls_active) {
@@ -2378,7 +2387,7 @@ struct InkCudaRunner {
             s0.d_attn_pm = d_attn_pm; s0.d_attn_pl = d_attn_pl; s0.d_attn_po = d_attn_po;
             s0.d_pf_q = d_pf_q; s0.d_pf_k = d_pf_k; s0.d_pf_v = d_pf_v; s0.d_pf_p = d_pf_p;
             s0.d_pf_s = d_pf_s; s0.d_pf_o = d_pf_o; s0.d_pf_ot = d_pf_ot; s0.d_pf_m = d_pf_m; s0.d_pf_l = d_pf_l;
-            s0.pf_kv_cap = pf_kv_cap;
+            s0.pf_kv_cap = pf_kv_cap; s0.pf_elem_cap = pf_elem_cap;
             s0.d_x_bf16 = d_x_bf16; s0.d_w_scratch = d_w_scratch;
             s0.d_slots = d_slots; s0.d_pos = d_pos;
 
@@ -3081,18 +3090,30 @@ struct InkCudaRunner {
 
     // Strictly O(1)-VRAM prefill attention scratch (fixed KV_TILE = 2048 -> ~114 MiB forever, fixes #6609 & #6605!).
     // Non-fatal: returns false if VRAM is tight so caller seamlessly falls back to zero-VRAM k_ink_flash_gqa_gqa3!
-    bool ensure_pf_attn(int /*K_len*/) {
+    // sm_61 (P40) の FP16 は FP32 の 1/64 なので、この世代だけ FP32 で pack して SGEMM で積む
+    static int pf_elem_for_cc(int cc) { return cc == 61 ? 4 : 2; }
+
+    // タイル経路から per-token 経路に落ちた理由を 1 回だけ出す (毎 visit 出すと 48 行/チャンクになる)
+    void pf_tile_warn_once(const char* why) {
+        if (pf_tile_warned) return;
+        pf_tile_warned = true;
+        std::fprintf(stderr, "[InkCUDA] tiled prefill attention is off (%s): per-token flash path\n", why);
+    }
+
+    bool ensure_pf_attn(int /*K_len*/, int pf_elem = 2) {
         constexpr int Q_CH = 256;
-        if (d_pf_q && pf_kv_cap >= kInkPfKvTile) return true;
+        if (d_pf_q && pf_kv_cap >= kInkPfKvTile && pf_elem_cap == pf_elem) return true;
         INK_CK(cudaStreamSynchronize(st));
         auto fr = [](auto*& p) { if (p) { cudaFree(p); p = nullptr; } };
         fr(d_pf_q); fr(d_pf_k); fr(d_pf_v); fr(d_pf_p);
         fr(d_pf_s); fr(d_pf_o); fr(d_pf_ot); fr(d_pf_m); fr(d_pf_l);
         pf_kv_cap = 0;
-        const size_t q_b  = (size_t)kInkHeads * max_batch * kInkHeadDim * sizeof(__nv_bfloat16);
-        const size_t kv_b = (size_t)kInkHeads * kInkPfKvTile * kInkHeadDim * sizeof(__nv_bfloat16);
+        pf_elem_cap = 0;
+        const size_t esz = (size_t)pf_elem;
+        const size_t q_b  = (size_t)kInkHeads * max_batch * kInkHeadDim * esz;
+        const size_t kv_b = (size_t)kInkHeads * kInkPfKvTile * kInkHeadDim * esz;
         const size_t s_b  = (size_t)kInkHeads * Q_CH * kInkPfKvTile * sizeof(float);
-        const size_t p_b  = (size_t)kInkHeads * Q_CH * kInkPfKvTile * sizeof(__nv_bfloat16);
+        const size_t p_b  = (size_t)kInkHeads * Q_CH * kInkPfKvTile * esz;
         const size_t o_b  = (size_t)kInkHeads * Q_CH * kInkHeadDim * sizeof(float);
         const size_t ml_b = (size_t)kInkHeads * Q_CH * sizeof(float);
         const size_t need = q_b + 2 * kv_b + s_b + p_b + 2 * o_b + 2 * ml_b;
@@ -3114,6 +3135,7 @@ struct InkCudaRunner {
             return false;
         }
         pf_kv_cap = kInkPfKvTile;
+        pf_elem_cap = pf_elem;
         return true;
     }
 
@@ -3307,23 +3329,43 @@ struct InkCudaRunner {
                     (mode == 2) ? d_tree_anc : nullptr, (mode == 2) ? d_tree_dep : nullptr,
                     p0_val, d_attn_pm, d_attn_pl, d_attn_po, M, n_sp);
                 k_ink_flash_gqa_merge<<<gr, 128, 0, st>>>(d_attn_pm, d_attn_pl, d_attn_po, d_gate_attn, d_attn_out, M, n_sp);
-            } else if (mode == 0 && M >= 128 && (cur_cc >= 70 || cur_cc == 60) && ensure_pf_attn(kInkPfKvTile)) {
+            } else if (mode == 0 && M >= 128 && (cur_cc >= 70 || cur_cc == 60 || cur_cc == 61) && pf_tile_enabled && ensure_pf_attn(kInkPfKvTile, pf_elem_for_cc(cur_cc))) {
                 // O(1)-VRAM KV-Tiled Online-Softmax Tensor Core Prefill Attention (fixed <= ~114 MiB even at 256K+ ctx!)
-                const bool use_fp16_pf = (cur_cc < 80);
-                const cudaDataType_t pf_dt = use_fp16_pf ? CUDA_R_16F : CUDA_R_16BF;
+                // sm_61 は FP32 で積むので作業領域は 114 -> 約 156 MiB になる (128K では 8 GB 空くので影響しない)
+                // pfd: 0 = BF16 (sm_80+), 1 = FP16 (sm_60/70/75 は従来どおり), 2 = FP32 (sm_61 だけ。P40 の FP16 は FP32 の 1/64)
+                const int pfd = (cur_cc == 61) ? 2 : (cur_cc < 80 ? 1 : 0);
+                const cudaDataType_t pf_dt = (pfd == 2) ? CUDA_R_32F : (pfd == 1 ? CUDA_R_16F : CUDA_R_16BF);
                 const cublasGemmAlgo_t pf_algo = (cur_cc >= 70) ? CUBLAS_GEMM_DEFAULT_TENSOR_OP : CUBLAS_GEMM_DEFAULT;
                 const int k_start = is_swa ? std::max(0, p0_val - kInkSwaWin + 1) : 0;
                 const int K_len = (p0_val + M) - k_start;
-                if (use_fp16_pf) k_ink_pf_pack_q<true><<<dim3(kInkHeads, M), 128, 0, st>>>(d_q, d_pf_q, M);
-                else             k_ink_pf_pack_q<false><<<dim3(kInkHeads, M), 128, 0, st>>>(d_q, d_pf_q, M);
+                // d_pf_* の宣言は BF16 だが pfd==2 では FP32 が入っている。cublas には要素サイズで進めたアドレスを渡す
+                const int pf_esz = (pfd == 2) ? 4 : 2;
+                auto pf_off = [pf_esz](const __nv_bfloat16* base, size_t elems) -> const void* {
+                    return reinterpret_cast<const char*>(base) + elems * (size_t)pf_esz;
+                };
+                auto pf_pack_q = [&]() {
+                    if (pfd == 2)      k_ink_pf_pack_q<2><<<dim3(kInkHeads, M), 128, 0, st>>>(d_q, d_pf_q, M);
+                    else if (pfd == 1) k_ink_pf_pack_q<1><<<dim3(kInkHeads, M), 128, 0, st>>>(d_q, d_pf_q, M);
+                    else               k_ink_pf_pack_q<0><<<dim3(kInkHeads, M), 128, 0, st>>>(d_q, d_pf_q, M);
+                };
+                auto pf_pack_kv = [&](int kt, int Kt) {
+                    if (pfd == 2)      k_ink_pf_pack_kv<2><<<dim3(kInkKVHeads, Kt), 128, 0, st>>>(kv_desc[visit], slot0, kt, Kt, d_pf_k, d_pf_v);
+                    else if (pfd == 1) k_ink_pf_pack_kv<1><<<dim3(kInkKVHeads, Kt), 128, 0, st>>>(kv_desc[visit], slot0, kt, Kt, d_pf_k, d_pf_v);
+                    else               k_ink_pf_pack_kv<0><<<dim3(kInkKVHeads, Kt), 128, 0, st>>>(kv_desc[visit], slot0, kt, Kt, d_pf_k, d_pf_v);
+                };
+                pf_pack_q();
 
                 constexpr int Q_CH = 256;
                 const float sc_qk = 0.08838834764831845f;
                 const float one = 1.0f, zero = 0.0f;
 
                 if (K_len <= kInkPfKvTile) {
-                    if (use_fp16_pf) k_ink_pf_pack_kv<true><<<dim3(kInkKVHeads, K_len), 128, 0, st>>>(kv_desc[visit], slot0, k_start, K_len, d_pf_k, d_pf_v);
-                    else             k_ink_pf_pack_kv<false><<<dim3(kInkKVHeads, K_len), 128, 0, st>>>(kv_desc[visit], slot0, k_start, K_len, d_pf_k, d_pf_v);
+                    pf_pack_kv(k_start, K_len);
+                    auto pf_softmax_rel = [&](int q0, int C, int ks, int Kt) {
+                        if (pfd == 2)      k_ink_pf_softmax_rel_sink<2><<<dim3(C, kInkHeads), 256, 0, st>>>(d_pf_s, d_rel_table, d_sinks, d_pf_p, q0, C, ks, Kt, p0_val, is_swa);
+                        else if (pfd == 1) k_ink_pf_softmax_rel_sink<1><<<dim3(C, kInkHeads), 256, 0, st>>>(d_pf_s, d_rel_table, d_sinks, d_pf_p, q0, C, ks, Kt, p0_val, is_swa);
+                        else               k_ink_pf_softmax_rel_sink<0><<<dim3(C, kInkHeads), 256, 0, st>>>(d_pf_s, d_rel_table, d_sinks, d_pf_p, q0, C, ks, Kt, p0_val, is_swa);
+                    };
                     for (int q0 = 0; q0 < M; q0 += Q_CH) {
                         const int C = std::min(Q_CH, M - q0);
                         const int k_sub_beg = is_swa ? std::max(k_start, p0_val + q0 - kInkSwaWin + 1) : k_start;
@@ -3333,21 +3375,15 @@ struct InkCudaRunner {
                         INK_CUBLAS_CK(cublasGemmStridedBatchedEx(
                             cublas, CUBLAS_OP_T, CUBLAS_OP_N,
                             K_sub, C, kInkHeadDim, &sc_qk,
-                            d_pf_k + (size_t)k_off * kInkHeadDim, pf_dt, kInkHeadDim, (long long)K_len * kInkHeadDim,
-                            d_pf_q + (size_t)q0 * kInkHeadDim, pf_dt, kInkHeadDim, (long long)M * kInkHeadDim,
+                            pf_off(d_pf_k, (size_t)k_off * kInkHeadDim), pf_dt, kInkHeadDim, (long long)K_len * kInkHeadDim,
+                            pf_off(d_pf_q, (size_t)q0 * kInkHeadDim), pf_dt, kInkHeadDim, (long long)M * kInkHeadDim,
                             &zero, d_pf_s, CUDA_R_32F, K_sub, (long long)C * K_sub,
                             kInkHeads, CUBLAS_COMPUTE_32F, pf_algo));
-                        if (use_fp16_pf) {
-                            k_ink_pf_softmax_rel_sink<true><<<dim3(C, kInkHeads), 256, 0, st>>>(
-                                d_pf_s, d_rel_table, d_sinks, d_pf_p, q0, C, k_sub_beg, K_sub, p0_val, is_swa);
-                        } else {
-                            k_ink_pf_softmax_rel_sink<false><<<dim3(C, kInkHeads), 256, 0, st>>>(
-                                d_pf_s, d_rel_table, d_sinks, d_pf_p, q0, C, k_sub_beg, K_sub, p0_val, is_swa);
-                        }
+                        pf_softmax_rel(q0, C, k_sub_beg, K_sub);
                         INK_CUBLAS_CK(cublasGemmStridedBatchedEx(
                             cublas, CUBLAS_OP_N, CUBLAS_OP_N,
                             kInkHeadDim, C, K_sub, &one,
-                            d_pf_v + (size_t)k_off * kInkHeadDim, pf_dt, kInkHeadDim, (long long)K_len * kInkHeadDim,
+                            pf_off(d_pf_v, (size_t)k_off * kInkHeadDim), pf_dt, kInkHeadDim, (long long)K_len * kInkHeadDim,
                             d_pf_p, pf_dt, K_sub, (long long)C * K_sub,
                             &zero, d_pf_o, CUDA_R_32F, kInkHeadDim, (long long)C * kInkHeadDim,
                             kInkHeads, CUBLAS_COMPUTE_32F, pf_algo));
@@ -3356,6 +3392,11 @@ struct InkCudaRunner {
                 } else {
                     // Long-context KV-Tiled Online-Softmax TC Attention (K_len > 2048 -> O(1) 114 MiB VRAM forever!)
                     float* d_alpha_tmp = d_ctrl_gain;  // [max_batch * 2304] >> 24 * 256 floats!
+                    auto pf_softmax_tile = [&](int q0, int C, int kt, int Kt) {
+                        if (pfd == 2)      k_ink_pf_softmax_tile_online<2><<<dim3(C, kInkHeads), 256, 0, st>>>(d_pf_s, d_rel_table, d_pf_p, d_pf_m, d_pf_l, d_alpha_tmp, q0, C, kt, Kt, p0_val, is_swa);
+                        else if (pfd == 1) k_ink_pf_softmax_tile_online<1><<<dim3(C, kInkHeads), 256, 0, st>>>(d_pf_s, d_rel_table, d_pf_p, d_pf_m, d_pf_l, d_alpha_tmp, q0, C, kt, Kt, p0_val, is_swa);
+                        else               k_ink_pf_softmax_tile_online<0><<<dim3(C, kInkHeads), 256, 0, st>>>(d_pf_s, d_rel_table, d_pf_p, d_pf_m, d_pf_l, d_alpha_tmp, q0, C, kt, Kt, p0_val, is_swa);
+                    };
                     for (int q0 = 0; q0 < M; q0 += Q_CH) {
                         const int C = std::min(Q_CH, M - q0);
                         const int k_sub_beg = is_swa ? std::max(k_start, p0_val + q0 - kInkSwaWin + 1) : k_start;
@@ -3364,22 +3405,15 @@ struct InkCudaRunner {
                         for (int kt = k_sub_beg; kt < k_sub_end; kt += kInkPfKvTile) {
                             const int K_t = std::min(kInkPfKvTile, k_sub_end - kt);
                             const bool is_last = (kt + K_t >= k_sub_end);
-                            if (use_fp16_pf) k_ink_pf_pack_kv<true><<<dim3(kInkKVHeads, K_t), 128, 0, st>>>(kv_desc[visit], slot0, kt, K_t, d_pf_k, d_pf_v);
-                            else             k_ink_pf_pack_kv<false><<<dim3(kInkKVHeads, K_t), 128, 0, st>>>(kv_desc[visit], slot0, kt, K_t, d_pf_k, d_pf_v);
+                            pf_pack_kv(kt, K_t);
                             INK_CUBLAS_CK(cublasGemmStridedBatchedEx(
                                 cublas, CUBLAS_OP_T, CUBLAS_OP_N,
                                 K_t, C, kInkHeadDim, &sc_qk,
                                 d_pf_k, pf_dt, kInkHeadDim, (long long)K_t * kInkHeadDim,
-                                d_pf_q + (size_t)q0 * kInkHeadDim, pf_dt, kInkHeadDim, (long long)M * kInkHeadDim,
+                                pf_off(d_pf_q, (size_t)q0 * kInkHeadDim), pf_dt, kInkHeadDim, (long long)M * kInkHeadDim,
                                 &zero, d_pf_s, CUDA_R_32F, K_t, (long long)C * K_t,
                                 kInkHeads, CUBLAS_COMPUTE_32F, pf_algo));
-                            if (use_fp16_pf) {
-                                k_ink_pf_softmax_tile_online<true><<<dim3(C, kInkHeads), 256, 0, st>>>(
-                                    d_pf_s, d_rel_table, d_pf_p, d_pf_m, d_pf_l, d_alpha_tmp, q0, C, kt, K_t, p0_val, is_swa);
-                            } else {
-                                k_ink_pf_softmax_tile_online<false><<<dim3(C, kInkHeads), 256, 0, st>>>(
-                                    d_pf_s, d_rel_table, d_pf_p, d_pf_m, d_pf_l, d_alpha_tmp, q0, C, kt, K_t, p0_val, is_swa);
-                            }
+                            pf_softmax_tile(q0, C, kt, K_t);
                             INK_CUBLAS_CK(cublasGemmStridedBatchedEx(
                                 cublas, CUBLAS_OP_N, CUBLAS_OP_N,
                                 kInkHeadDim, C, K_t, &one,
@@ -3393,6 +3427,10 @@ struct InkCudaRunner {
                     }
                 }
             } else {
+                // 条件は満たすが作業領域が取れない / STRATA_INK_PF_TILE=0 のときは黙って per-token に落ちる (ログは 1 行だけ)
+                if (mode == 0 && M >= 128 && (cur_cc >= 70 || cur_cc == 60 || cur_cc == 61)) {
+                    pf_tile_warn_once(pf_tile_enabled ? "workspace not available" : "STRATA_INK_PF_TILE=0");
+                }
                 dim3 g3(kInkKVHeads, M);
                 k_ink_flash_gqa_gqa3<<<g3, 128, 0, st>>>(
                     d_q, d_rel_table, d_sinks, d_gate_attn,

@@ -738,9 +738,18 @@ __global__ void __launch_bounds__(128) k_ink_flash_gqa_gqa3(
 // ============================================================================
 // Tensor Core Prefill Flash-GQA Helpers (cuBLAS BF16 on sm_80+ and FP16 on sm_60..sm_75 -> 6-15x faster prefill!)
 // ============================================================================
-template <bool USE_FP16>
-__device__ __forceinline__ uint16_t pf_cvt_from_f32(float v) {
-    if constexpr (USE_FP16) {
+// PFDT: 0 = BF16, 1 = FP16, 2 = FP32
+// sm_61 (P40) の FP16 は FP32 の 1/64 なので、積を FP16 で行うと 5 倍以上遅くなる。保存型を PFDT で選べるようにする
+template <int PFDT> struct PfStore;
+template <> struct PfStore<0> { using type = uint16_t; };
+template <> struct PfStore<1> { using type = uint16_t; };
+template <> struct PfStore<2> { using type = float; };
+
+template <int PFDT>
+__device__ __forceinline__ typename PfStore<PFDT>::type pf_cvt_from_f32(float v) {
+    if constexpr (PFDT == 2) {
+        return v;
+    } else if constexpr (PFDT == 1) {
         v = fminf(fmaxf(v, -65504.0f), 65504.0f);
         __half h = __float2half_rn(v);
         return *reinterpret_cast<const uint16_t*>(&h);
@@ -750,25 +759,26 @@ __device__ __forceinline__ uint16_t pf_cvt_from_f32(float v) {
     }
 }
 
-template <bool USE_FP16 = false>
+template <int PFDT = 0>
 __global__ void __launch_bounds__(128) k_ink_pf_pack_q(
     const float* __restrict__ q,        // [M, 24, 128]
-    void* __restrict__ q_out_v,         // [24, M, 128] BF16 or FP16
+    void* __restrict__ q_out_v,         // [24, M, 128] BF16 or FP16 or FP32
     int M) {
     const int h = blockIdx.x;  // 0..23
     const int m = blockIdx.y;  // 0..M-1
     const int d = threadIdx.x; // 0..127
     if (h >= kInkHeads || m >= M) return;
-    uint16_t* q_out = reinterpret_cast<uint16_t*>(q_out_v);
-    q_out[((size_t)h * M + m) * kInkHeadDim + d] = pf_cvt_from_f32<USE_FP16>(q[((size_t)m * kInkHeads + h) * kInkHeadDim + d]);
+    using pft = typename PfStore<PFDT>::type;
+    pft* q_out = reinterpret_cast<pft*>(q_out_v);
+    q_out[((size_t)h * M + m) * kInkHeadDim + d] = pf_cvt_from_f32<PFDT>(q[((size_t)m * kInkHeads + h) * kInkHeadDim + d]);
 }
 
-template <bool USE_FP16 = false>
+template <int PFDT = 0>
 __global__ void __launch_bounds__(128) k_ink_pf_pack_kv(
     InkKvVisitDesc kv,
     int slot0, int k_start, int K_len,
-    void* __restrict__ k_out_v,         // [24, K_len, 128] BF16 or FP16
-    void* __restrict__ v_out_v) {       // [24, K_len, 128] BF16 or FP16
+    void* __restrict__ k_out_v,         // [24, K_len, 128] BF16 or FP16 or FP32
+    void* __restrict__ v_out_v) {       // [24, K_len, 128] BF16 or FP16 or FP32
     const int kh = blockIdx.x;  // 0..7
     const int ki = blockIdx.y;  // 0..K_len-1
     const int d  = threadIdx.x; // 0..127
@@ -786,8 +796,9 @@ __global__ void __launch_bounds__(128) k_ink_pf_pack_kv(
     const uint8_t* pv8  = use_host ? kv.h_v_f8  : kv.v_f8;
     const float*   pksc = use_host ? kv.h_k_sc  : kv.k_sc;
     const float*   pvsc = use_host ? kv.h_v_sc  : kv.v_sc;
-    uint16_t kb, vb;
-    if constexpr (USE_FP16) {
+    using pft = typename PfStore<PFDT>::type;
+    pft kb, vb;
+    if constexpr (PFDT == 1) {
         if (kv.kv_fmt == 0) {
             kb = *reinterpret_cast<const uint16_t*>(&pk16[base]);
             vb = *reinterpret_cast<const uint16_t*>(&pv16[base]);
@@ -805,10 +816,10 @@ __global__ void __launch_bounds__(128) k_ink_pf_pack_kv(
                 const int qv = (int)((d & 1) ? (pb >> 4) : (pb & 0xFu)) - 8;
                 vf = (float)qv * pvsc[hbase];
             }
-            kb = pf_cvt_from_f32<true>(kf);
-            vb = pf_cvt_from_f32<true>(vf);
+            kb = pf_cvt_from_f32<1>(kf);
+            vb = pf_cvt_from_f32<1>(vf);
         }
-    } else {
+    } else if constexpr (PFDT == 0) {
         float kf, vf;
         if (kv.kv_fmt == 0) {
             kf = __half2float(pk16[base]);
@@ -825,11 +836,28 @@ __global__ void __launch_bounds__(128) k_ink_pf_pack_kv(
             const int qv = (int)((d & 1) ? (pb >> 4) : (pb & 0xFu)) - 8;
             vf = (float)qv * pvsc[hbase];
         }
-        kb = pf_cvt_from_f32<false>(kf);
-        vb = pf_cvt_from_f32<false>(vf);
+        kb = pf_cvt_from_f32<0>(kf);
+        vb = pf_cvt_from_f32<0>(vf);
+    } else {
+        // PFDT == 2 (FP32): 変換を挟まずそのまま積む
+        if (kv.kv_fmt == 0) {
+            kb = __half2float(pk16[base]);
+            vb = __half2float(pv16[base]);
+        } else if (kv.kv_fmt == 1) {
+            kb = e4m3_to_f32(pk8[base]) * pksc[hbase];
+            vb = e4m3_to_f32(pv8[base]) * pvsc[hbase];
+        } else if (kv.kv_fmt == 2) {
+            kb = (float)(int8_t)pk8[base] * pksc[hbase];
+            vb = (float)(int8_t)pv8[base] * pvsc[hbase];
+        } else {
+            kb = (float)(int8_t)pk8[base] * pksc[hbase];
+            const uint8_t pb = pv8[hbase * (kInkHeadDim / 2) + (d >> 1)];
+            const int qv = (int)((d & 1) ? (pb >> 4) : (pb & 0xFu)) - 8;
+            vb = (float)qv * pvsc[hbase];
+        }
     }
-    uint16_t* k_out = reinterpret_cast<uint16_t*>(k_out_v);
-    uint16_t* v_out = reinterpret_cast<uint16_t*>(v_out_v);
+    pft* k_out = reinterpret_cast<pft*>(k_out_v);
+    pft* v_out = reinterpret_cast<pft*>(v_out_v);
     const int h0 = 3 * kh;
     k_out[((size_t)(h0 + 0) * K_len + ki) * kInkHeadDim + d] = kb;
     k_out[((size_t)(h0 + 1) * K_len + ki) * kInkHeadDim + d] = kb;
@@ -840,12 +868,12 @@ __global__ void __launch_bounds__(128) k_ink_pf_pack_kv(
 }
 
 // 1-Pass Register-Cached RelPos + Causal/SWA Mask + Exact Per-Query Sink Softmax -> BF16/FP16 probs [24, C, K_sub]!
-template <bool USE_FP16 = false>
+template <int PFDT = 0>
 __global__ void __launch_bounds__(256) k_ink_pf_softmax_rel_sink(
     const float* __restrict__ scores,     // [24, C, K_len] F32 (already scaled by 1/sqrt(128))
     const float* __restrict__ rel_table,  // [M, 24, 1025]
     const float* __restrict__ sinks,      // [M, 24]
-    void* __restrict__ probs_v,           // [24, C, K_len] BF16 or FP16
+    void* __restrict__ probs_v,           // [24, C, K_len] BF16 or FP16 or FP32
     int q0, int C, int k_start, int K_len, int p0, bool is_swa) {
     const int ci = blockIdx.x;  // 0..C-1
     const int h  = blockIdx.y;  // 0..23
@@ -856,7 +884,8 @@ __global__ void __launch_bounds__(256) k_ink_pf_softmax_rel_sink(
     const float* sc_row = scores + ((size_t)h * C + ci) * K_len;
     const float* rt = rel_table + ((size_t)m * kInkHeads + h) * (kInkRelExtent + 1);
     const float sk = sinks[(size_t)m * kInkHeads + h];
-    uint16_t* pr_row = reinterpret_cast<uint16_t*>(probs_v) + ((size_t)h * C + ci) * K_len;
+    using pft = typename PfStore<PFDT>::type;
+    pft* pr_row = reinterpret_cast<pft*>(probs_v) + ((size_t)h * C + ci) * K_len;
     __shared__ float sh[32];
 
     if (K_len <= 2048) {
@@ -908,7 +937,7 @@ __global__ void __launch_bounds__(256) k_ink_pf_softmax_rel_sink(
         for (int t = 0; t < 8; ++t) {
             const int ki = t * 256 + tid;
             if (ki < K_len) {
-                pr_row[ki] = pf_cvt_from_f32<USE_FP16>(reg_ok[t] ? (reg_v[t] * inv_l) : 0.0f);
+                pr_row[ki] = pf_cvt_from_f32<PFDT>(reg_ok[t] ? (reg_v[t] * inv_l) : 0.0f);
             }
         }
         return;
@@ -951,7 +980,7 @@ __global__ void __launch_bounds__(256) k_ink_pf_softmax_rel_sink(
         if ((kp <= qp) && (!is_swa || dist < kInkSwaWin)) {
             p = __expf(sc_row[ki] + rt[min(dist, kInkRelExtent)] - mg) * inv_l;
         }
-        pr_row[ki] = pf_cvt_from_f32<USE_FP16>(p);
+        pr_row[ki] = pf_cvt_from_f32<PFDT>(p);
     }
 }
 
@@ -991,11 +1020,11 @@ __global__ void __launch_bounds__(128) k_ink_pf_online_init(
     o_acc[((size_t)h * C + ci) * kInkHeadDim + d] = 0.0f;
 }
 
-template <bool USE_FP16 = false>
+template <int PFDT = 0>
 __global__ void __launch_bounds__(256) k_ink_pf_softmax_tile_online(
     const float* __restrict__ scores,     // [24, C, K_t] F32 (K_t <= 2048)
     const float* __restrict__ rel_table,  // [M, 24, 1025]
-    void* __restrict__ probs_v,           // [24, C, K_t] BF16 or FP16 (unnormalized exp(s - m_new))
+    void* __restrict__ probs_v,           // [24, C, K_t] BF16 or FP16 or FP32 (unnormalized exp(s - m_new))
     float* __restrict__ m_acc,            // [24, C] in/out
     float* __restrict__ l_acc,            // [24, C] in/out
     float* __restrict__ alpha_out,        // [24, C] exp(m_old - m_new)
@@ -1009,7 +1038,8 @@ __global__ void __launch_bounds__(256) k_ink_pf_softmax_tile_online(
     const size_t st_idx = (size_t)h * C + ci;
     const float* sc_row = scores + st_idx * K_t;
     const float* rt     = rel_table + ((size_t)m * kInkHeads + h) * (kInkRelExtent + 1);
-    uint16_t* pr_row    = reinterpret_cast<uint16_t*>(probs_v) + st_idx * K_t;
+    using pft = typename PfStore<PFDT>::type;
+    pft* pr_row    = reinterpret_cast<pft*>(probs_v) + st_idx * K_t;
     __shared__ float sh[32];
 
     const float m_old = m_acc[st_idx];
@@ -1053,7 +1083,7 @@ __global__ void __launch_bounds__(256) k_ink_pf_softmax_tile_online(
         if (ki < K_t) {
             const float e = reg_ok[t] ? __expf(reg_v[t] - m_new) : 0.0f;
             tile_l += e;
-            pr_row[ki] = pf_cvt_from_f32<USE_FP16>(e);
+            pr_row[ki] = pf_cvt_from_f32<PFDT>(e);
         }
     }
     tile_l = block_sum(tile_l, sh);
