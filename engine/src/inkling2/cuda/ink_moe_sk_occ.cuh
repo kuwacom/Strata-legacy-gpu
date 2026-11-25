@@ -19,6 +19,14 @@ inline int ink_sk_occ_mode() {
     return mode;
 }
 
+// dn の活性 (h_sk) を shared にステージするか (既定 0 = 従来どおり global 直読)。
+// MAX_M==16 でだけ効く: 16 token x 18 block x 80 B = 22.5 KiB/CTA で、4 CTA/SM でも 90 KiB に収まる。
+// コピーは 16 B 単位のそのままの複製なので、値も演算順も変わらず y_pair は bit 一致する
+inline int ink_sk_dn_smem_mode() {
+    static const int mode = [] { const char* e = std::getenv("STRATA_INK_SK_DN_SMEM"); return e ? (std::atoi(e) != 0 ? 1 : 0) : 0; }();
+    return mode;
+}
+
 // gu 用。本体は k_ink_moe_gu_sk_fmt と同一で、違うのは __launch_bounds__ だけ
 template <int FMT, int MAX_M>
 __global__ void __launch_bounds__(128, 4) k_ink_moe_gu_sk_fmt_occ(
@@ -148,6 +156,72 @@ __global__ void __launch_bounds__(128, 4) k_ink_moe_dn_sk_fmt_occ(
     }
 }
 
+// dn 用 (MAX_M==16 専用)。活性を shared にステージする以外は k_ink_moe_dn_sk_fmt_occ と同一。
+// MAX_M=16 では従来 hp[m] が global を指し、1 CTA の 4 warp x 32 lane が同じ 22.5 KiB を
+// 何度も読み直していた (重み 29.4 KiB の 5 倍の L1 要求)。ここでは起動時に 1 回だけコピーする。
+// 値は 16 B 単位の複製で、dp4a の順序も従来と同一なので y_pair は bit 一致する
+template <int FMT, int MAX_M>
+__global__ void __launch_bounds__(128, 4) k_ink_moe_dn_sk_fmt_occ_smem(
+    const uint8_t* __restrict__ sec4_base,
+    const InkExpertDev* __restrict__ experts,
+    InkMoeTables tb,
+    const InkQ8_1_G64* __restrict__ h_sk,
+    const float* __restrict__ topk_w,
+    float* __restrict__ y_pair) {
+    const int ai = blockIdx.y;
+    if (ai >= *tb.nact) return;
+    const int e = tb.active[ai];
+    const InkExpertDev ed = experts[e];
+    if (ed.tier > 1 || ed.dn_code != FMT) return;
+    const int row0 = tb.off[e];
+    const int n_total = tb.cnt[e];
+
+    const int tid    = threadIdx.x;
+    const int sub    = tid >> 2;
+    const int g      = tid & 3;
+    const int pair_r = blockIdx.x * 32 + sub;
+
+    const uint8_t* body = sec4_base + ed.body_off;
+    constexpr size_t pair_b = 9ull * ink_sb_bytes(FMT);
+    const uint8_t* pr = body + ed.dn_off + (size_t)pair_r * pair_b;
+
+    // 16 token x 18 block x 80 B = 23,040 B。4 CTA/SM で 92,160 B (96 KiB 以内) なので occupancy は落ちない
+    __shared__ alignas(16) InkQ8_1_G64 s_hq[MAX_M][kInkInter / 64];
+
+    for (int off_m = 0; off_m < n_total; off_m += MAX_M) {
+        const int n_e = min(MAX_M, n_total - off_m);
+        float a0[MAX_M] = {}, a1[MAX_M] = {};
+        const InkQ8_1_G64* hp[MAX_M];
+        // 行は 1440 B (16 B の倍数) なので uint4 でそのまま複製できる。1 行 90 個を 128 thread で分ける
+        // 注: h_sk は pair スロット順 ([P,18]) なので tok_idx ではなく row0+off_m+m で引く
+        constexpr int N4 = (int)((kInkInter / 64) * sizeof(InkQ8_1_G64) / 16);
+        for (int m = 0; m < n_e; ++m) {
+            const uint4* src = reinterpret_cast<const uint4*>(h_sk + (size_t)(row0 + off_m + m) * (kInkInter / 64));
+            uint4* dst = reinterpret_cast<uint4*>(s_hq[m]);
+            for (int i = tid; i < N4; i += 128) dst[i] = src[i];
+        }
+        __syncthreads();
+#pragma unroll
+        for (int m = 0; m < MAX_M; ++m) hp[m] = s_hq[m];
+        if (pair_r < kInkHidden / 2) {
+            sk_dn_paired2_4lane<FMT, MAX_M>(pr, hp, n_e, g, a0, a1);
+            if (g == 0) {
+#pragma unroll
+                for (int m = 0; m < MAX_M; ++m) {
+                    if (m < n_e) {
+                        const int pid = tb.pairs[row0 + off_m + m];
+                        const float rw = topk_w[pid];
+                        y_pair[(size_t)pid * kInkHidden + 2 * pair_r]     = a0[m] * rw;
+                        y_pair[(size_t)pid * kInkHidden + 2 * pair_r + 1] = a1[m] * rw;
+                    }
+                }
+            }
+        }
+        // 次の反復のコピーが今の読み手の終了前に走らないようにする
+        if (off_m + MAX_M < n_total) __syncthreads();
+    }
+}
+
 // S2_K / S3_K を occupancy 版で起動し、起動した bit を mask から落とす。
 // 残りの bit が 0 なら true を返して呼び出し側の従来経路を止める。残れば false で従来経路に任せる
 // (mask を参照で受け取るのは、担当外の形式を呼び出し側の if 連鎖にそのまま流すため)
@@ -171,21 +245,38 @@ inline bool launch_ink_moe_gu_sk_occ(
     return mask == 0;
 }
 
+// dn の 1 形式を起動する。MAX_M==16 かつ smem のときだけ shared ステージ版を使う
+template <int FMT, int MAX_M>
+inline void launch_ink_moe_dn_sk_one(
+    bool smem, dim3 grid, cudaStream_t st,
+    const uint8_t* sec4_base, const InkExpertDev* experts, InkMoeTables tb,
+    const InkQ8_1_G64* h_sk, const float* topk_w, float* y_pair) {
+    if constexpr (MAX_M == 16) {
+        if (smem) { k_ink_moe_dn_sk_fmt_occ_smem<FMT, MAX_M><<<grid, 128, 0, st>>>(sec4_base, experts, tb, h_sk, topk_w, y_pair); return; }
+    }
+    k_ink_moe_dn_sk_fmt_occ<FMT, MAX_M><<<grid, 128, 0, st>>>(sec4_base, experts, tb, h_sk, topk_w, y_pair);
+}
+
+// dn の S2_K / S3_K を起動する (smem の有無を明示できる版)。mask は変更しない
+template <int MAX_M>
+inline void launch_ink_moe_dn_sk_ex(
+    bool smem, dim3 grid, cudaStream_t st, uint32_t mask,
+    const uint8_t* sec4_base, const InkExpertDev* experts, InkMoeTables tb,
+    const InkQ8_1_G64* h_sk, const float* topk_w, float* y_pair) {
+    if (mask & (1u << FMT_S2_K)) launch_ink_moe_dn_sk_one<FMT_S2_K, MAX_M>(smem, grid, st, sec4_base, experts, tb, h_sk, topk_w, y_pair);
+    if (mask & (1u << FMT_S3_K)) launch_ink_moe_dn_sk_one<FMT_S3_K, MAX_M>(smem, grid, st, sec4_base, experts, tb, h_sk, topk_w, y_pair);
+}
+
 template <int MAX_M>
 inline bool launch_ink_moe_dn_sk_occ(
     dim3 grid, cudaStream_t st, uint32_t& mask,
     const uint8_t* sec4_base, const InkExpertDev* experts, InkMoeTables tb,
     const InkQ8_1_G64* h_sk, const float* topk_w, float* y_pair) {
     if (mask == 0 || ink_sk_occ_mode() == 0) return false;
-    uint32_t handled = 0;
-    if (mask & (1u << FMT_S2_K)) {
-        k_ink_moe_dn_sk_fmt_occ<FMT_S2_K, MAX_M><<<grid, 128, 0, st>>>(sec4_base, experts, tb, h_sk, topk_w, y_pair);
-        handled |= 1u << FMT_S2_K;
-    }
-    if (mask & (1u << FMT_S3_K)) {
-        k_ink_moe_dn_sk_fmt_occ<FMT_S3_K, MAX_M><<<grid, 128, 0, st>>>(sec4_base, experts, tb, h_sk, topk_w, y_pair);
-        handled |= 1u << FMT_S3_K;
-    }
+    // smem 版は MAX_M==16 のときだけ意味がある (MAX_M<=4 は従来から活性を shared に置いている)
+    const bool smem = (MAX_M == 16) && (ink_sk_dn_smem_mode() != 0);
+    const uint32_t handled = mask & ((1u << FMT_S2_K) | (1u << FMT_S3_K));
+    if (handled) launch_ink_moe_dn_sk_ex<MAX_M>(smem, grid, st, handled, sec4_base, experts, tb, h_sk, topk_w, y_pair);
     mask &= ~handled;
     return mask == 0;
 }
