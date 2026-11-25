@@ -759,26 +759,36 @@ __device__ __forceinline__ typename PfStore<PFDT>::type pf_cvt_from_f32(float v)
     }
 }
 
+// gqa=1 では [24, M, 128] ではなく、KV head 8 本の batch に GQA 3 head を n 方向で並べた [8, 3C, 128] に書く。
+// こうすると QK を batch=8 / n=3C の 1 呼び出しで回せて、K の読みが 3 分の 1 になる (q ブロック単位で pack する)
 template <int PFDT = 0>
 __global__ void __launch_bounds__(128) k_ink_pf_pack_q(
     const float* __restrict__ q,        // [M, 24, 128]
-    void* __restrict__ q_out_v,         // [24, M, 128] BF16 or FP16 or FP32
-    int M) {
-    const int h = blockIdx.x;  // 0..23
-    const int m = blockIdx.y;  // 0..M-1
-    const int d = threadIdx.x; // 0..127
+    void* __restrict__ q_out_v,         // gqa=0: [24, M, 128] / gqa=1: [8, 3C, 128]
+    int M, int q0, int C, int gqa) {
+    const int h = blockIdx.x;   // 0..23
+    const int m = q0 + blockIdx.y;  // gqa=0 は q0=0 で grid.y = M、gqa=1 は grid.y = C
+    const int d = threadIdx.x;  // 0..127
     if (h >= kInkHeads || m >= M) return;
     using pft = typename PfStore<PFDT>::type;
     pft* q_out = reinterpret_cast<pft*>(q_out_v);
-    q_out[((size_t)h * M + m) * kInkHeadDim + d] = pf_cvt_from_f32<PFDT>(q[((size_t)m * kInkHeads + h) * kInkHeadDim + d]);
+    const pft val = pf_cvt_from_f32<PFDT>(q[((size_t)m * kInkHeads + h) * kInkHeadDim + d]);
+    size_t dst;
+    if (gqa) {
+        // 同じ KV head (h/3) の 3 head を、QK の B の列 (rep*C + ci) の順に並べる
+        dst = ((size_t)(h / 3) * 3 * C + (size_t)(h % 3) * C + (m - q0)) * kInkHeadDim + d;
+    } else {
+        dst = ((size_t)h * M + m) * kInkHeadDim + d;
+    }
+    q_out[dst] = val;
 }
 
 template <int PFDT = 0>
 __global__ void __launch_bounds__(128) k_ink_pf_pack_kv(
     InkKvVisitDesc kv,
-    int slot0, int k_start, int K_len,
-    void* __restrict__ k_out_v,         // [24, K_len, 128] BF16 or FP16 or FP32
-    void* __restrict__ v_out_v) {       // [24, K_len, 128] BF16 or FP16 or FP32
+    int slot0, int k_start, int K_len, int ncopy,
+    void* __restrict__ k_out_v,         // [ncopy*8, K_len, 128] BF16 or FP16 or FP32
+    void* __restrict__ v_out_v) {       // [ncopy*8, K_len, 128] BF16 or FP16 or FP32
     const int kh = blockIdx.x;  // 0..7
     const int ki = blockIdx.y;  // 0..K_len-1
     const int d  = threadIdx.x; // 0..127
@@ -858,13 +868,12 @@ __global__ void __launch_bounds__(128) k_ink_pf_pack_kv(
     }
     pft* k_out = reinterpret_cast<pft*>(k_out_v);
     pft* v_out = reinterpret_cast<pft*>(v_out_v);
-    const int h0 = 3 * kh;
-    k_out[((size_t)(h0 + 0) * K_len + ki) * kInkHeadDim + d] = kb;
-    k_out[((size_t)(h0 + 1) * K_len + ki) * kInkHeadDim + d] = kb;
-    k_out[((size_t)(h0 + 2) * K_len + ki) * kInkHeadDim + d] = kb;
-    v_out[((size_t)(h0 + 0) * K_len + ki) * kInkHeadDim + d] = vb;
-    v_out[((size_t)(h0 + 1) * K_len + ki) * kInkHeadDim + d] = vb;
-    v_out[((size_t)(h0 + 2) * K_len + ki) * kInkHeadDim + d] = vb;
+    // ncopy=3 は GQA の 3 head へ同じ値を複製する従来動作、ncopy=1 は KV head 1 本ぶんだけ書く (書きが 3 分の 1)
+    const int h0 = kh * ncopy;
+    for (int r = 0; r < ncopy; ++r) {
+        k_out[((size_t)(h0 + r) * K_len + ki) * kInkHeadDim + d] = kb;
+        v_out[((size_t)(h0 + r) * K_len + ki) * kInkHeadDim + d] = vb;
+    }
 }
 
 // 1-Pass Register-Cached RelPos + Causal/SWA Mask + Exact Per-Query Sink Softmax -> BF16/FP16 probs [24, C, K_sub]!
@@ -1091,33 +1100,6 @@ __global__ void __launch_bounds__(256) k_ink_pf_softmax_tile_online(
         m_acc[st_idx]     = m_new;
         l_acc[st_idx]     = l_acc[st_idx] * alpha + tile_l;
         alpha_out[st_idx] = alpha;
-    }
-}
-
-// PV を m=C / n=head_dim の向きで積んだときの O^T [24, 128, C] を通常の O [24, C, 128] に直す
-// (m/n を入れ替えると出力が転置になるため、既存の accum / unpack をそのまま使うには 1 回の転置が要る)
-__global__ void __launch_bounds__(128) k_ink_pf_ot_to_o(
-    const float* __restrict__ o_t,        // [24, 128, C] 列優先 (d が行、ci が列)
-    float* __restrict__ o,                // [24, C, 128]
-    int C) {
-    __shared__ float sh[32][129];         // [ci_local][d] (+1 でバンク衝突を避ける)
-    const int h = blockIdx.x;
-    const int ci0 = blockIdx.y * 32;
-    const int lane = threadIdx.x & 31;
-    const int warp = threadIdx.x >> 5;    // 4 warp で d を 32 本ずつ分担する
-    const float* src = o_t + (size_t)h * kInkHeadDim * C;
-    for (int dd = 0; dd < 32; ++dd) {
-        const int d = warp * 32 + dd;
-        const int ci = ci0 + lane;
-        sh[lane][d] = (ci < C) ? src[(size_t)d * C + ci] : 0.0f;   // ci 方向に連続 -> coalesced
-    }
-    __syncthreads();
-    float* dst = o + (size_t)h * C * kInkHeadDim;
-    for (int cl = 0; cl < 32; ++cl) {
-        const int ci = ci0 + cl;
-        if (ci >= C) break;
-        const int d = warp * 32 + lane;
-        dst[(size_t)ci * kInkHeadDim + d] = sh[cl][d];
     }
 }
 

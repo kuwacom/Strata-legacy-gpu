@@ -1831,7 +1831,9 @@ struct InkCudaRunner {
     // 読み書きする側はこの要素サイズでアドレスを進める
     int pf_elem_cap = 0;          // d_pf_q/k/v/p の 1 要素のバイト数 (2 = BF16/FP16, 4 = FP32)
     bool pf_tile_enabled = true;  // STRATA_INK_PF_TILE=0: タイル型 prefill attention を止めて per-token 経路に戻す
-    int pf_pv_shape = 0;          // STRATA_INK_PV_SHAPE: PV SGEMM の形状バリアント (0 = 現行、1 = m/n 入れ替え、2 = KV head 束ね)
+    int pf_pv_shape = 2;          // STRATA_INK_PV_SHAPE: 0 = 従来 (m=128/n=C/batch=24)、2 = KV head 8 本を n=3C で束ねる (既定)
+    int pf_gqa_pack = 0;          // STRATA_INK_GQA_PACK=1: pack_kv の GQA 3 複製をやめ、QK/PV を batch=8 で回す
+    int pf_gqa_cap = -1;          // 作業領域を確保したときの pf_gqa_pack
     bool pf_tile_warned = false;  // フォールバックのログは 1 回だけ出す
     float *d_stage_k = nullptr, *d_stage_v = nullptr, *d_stage_sconv = nullptr;  // Tree-16 verify staging
     InkKvVisitDesc* d_kv_desc_arr = nullptr;
@@ -2213,11 +2215,18 @@ struct InkCudaRunner {
         if (const char* pt = std::getenv("STRATA_INK_PF_TILE"); pt && pt[0] == '0') pf_tile_enabled = false;
         // 計測専用: STRATA_INK_ATTN_PROF=1 でタイル型 prefill attention のステージ別 event を取る (既定 off = ゼロオーバーヘッド)
         if (const char* ap = std::getenv("STRATA_INK_ATTN_PROF"); ap && ap[0] == '1') attn_prof = true;
-        // 実験: PV SGEMM の形状を選ぶ (0 = 現行 m=head_dim/n=C/batch=24、1 = m/n 入れ替え (O^T が返る)、2 = KV head 8 本を n=3C で束ねる)
-        if (const char* ps = std::getenv("STRATA_INK_PV_SHAPE"); ps && ps[0] >= '0' && ps[0] <= '2' && ps[1] == '\0') {
-            pf_pv_shape = ps[0] - '0';
-            std::fprintf(stderr, "[InkCUDA] PV SGEMM shape variant = %d\n", pf_pv_shape);
+        // PV SGEMM の形状 (既定 2 = KV head 8 本を n=3C で束ねる。0 で従来の m=head_dim/n=C/batch=24 に戻る)
+        // shape 1 (m/n 入れ替え) は PV が遅くなるため削除した
+        if (const char* ps = std::getenv("STRATA_INK_PV_SHAPE"); ps && ps[1] == '\0') {
+            if (ps[0] == '0') pf_pv_shape = 0;
+            else if (ps[0] == '1') std::fprintf(stderr, "[InkCUDA] PV SGEMM shape 1 was removed; keeping shape 2\n");
+            else if (ps[0] == '2') pf_pv_shape = 2;
         }
+        // GQA pack: 1 で pack_kv の 3 複製をやめる (K/V の書きが 3 分の 1)。QK/PV は batch=8 で回す
+        if (const char* gp = std::getenv("STRATA_INK_GQA_PACK"); gp && gp[0] == '1' && gp[1] == '\0') pf_gqa_pack = 1;
+        if (pf_gqa_pack) pf_pv_shape = 2;   // KV head 8 本しか pack しないので shape 0 (batch=24) は成立しない
+        std::fprintf(stderr, "[InkCUDA] PV SGEMM shape = %d\n", pf_pv_shape);
+        if (pf_gqa_pack) std::fprintf(stderr, "[InkCUDA] GQA pack = 1 (pack_kv 3 -> 1 copy, QK/PV batch=8)\n");
         INK_CK(cudaStreamCreate(&st));
         INK_CK(cudaEventCreate(&ev_p0));
         INK_CK(cudaEventCreate(&ev_p1));
@@ -3204,7 +3213,7 @@ struct InkCudaRunner {
 
     bool ensure_pf_attn(int /*K_len*/, int pf_elem = 2) {
         constexpr int Q_CH = 256;
-        if (d_pf_q && pf_kv_cap >= kInkPfKvTile && pf_elem_cap == pf_elem) return true;
+        if (d_pf_q && pf_kv_cap >= kInkPfKvTile && pf_elem_cap == pf_elem && pf_gqa_cap == pf_gqa_pack) return true;
         INK_CK(cudaStreamSynchronize(st));
         auto fr = [](auto*& p) { if (p) { cudaFree(p); p = nullptr; } };
         fr(d_pf_q); fr(d_pf_k); fr(d_pf_v); fr(d_pf_p);
@@ -3213,7 +3222,8 @@ struct InkCudaRunner {
         pf_elem_cap = 0;
         const size_t esz = (size_t)pf_elem;
         const size_t q_b  = (size_t)kInkHeads * max_batch * kInkHeadDim * esz;
-        const size_t kv_b = (size_t)kInkHeads * kInkPfKvTile * kInkHeadDim * esz;
+        // GQA_PACK=1 では K/V を KV head 8 本ぶんしか持たない (24 -> 8 で 2 本あわせて 32 MiB 減)
+        const size_t kv_b = (size_t)(pf_gqa_pack ? kInkKVHeads : kInkHeads) * kInkPfKvTile * kInkHeadDim * esz;
         const size_t s_b  = (size_t)kInkHeads * Q_CH * kInkPfKvTile * sizeof(float);
         const size_t p_b  = (size_t)kInkHeads * Q_CH * kInkPfKvTile * esz;
         const size_t o_b  = (size_t)kInkHeads * Q_CH * kInkHeadDim * sizeof(float);
@@ -3238,6 +3248,7 @@ struct InkCudaRunner {
         }
         pf_kv_cap = kInkPfKvTile;
         pf_elem_cap = pf_elem;
+        pf_gqa_cap = pf_gqa_pack;
         return true;
     }
 
@@ -3448,39 +3459,58 @@ struct InkCudaRunner {
                 auto pf_off = [pf_esz](const __nv_bfloat16* base, size_t elems) -> const void* {
                     return reinterpret_cast<const char*>(base) + elems * (size_t)pf_esz;
                 };
-                auto pf_pack_q = [&]() {
-                    if (pfd == 2)      k_ink_pf_pack_q<2><<<dim3(kInkHeads, M), 128, 0, st>>>(d_q, d_pf_q, M);
-                    else if (pfd == 1) k_ink_pf_pack_q<1><<<dim3(kInkHeads, M), 128, 0, st>>>(d_q, d_pf_q, M);
-                    else               k_ink_pf_pack_q<0><<<dim3(kInkHeads, M), 128, 0, st>>>(d_q, d_pf_q, M);
+                // gqa=1 は q ブロック単位で [8, 3C, 128] に pack するので q ループの中で呼ぶ
+                auto pf_pack_q = [&](int q0, int C) {
+                    const int gy = pf_gqa_pack ? C : M;
+                    if (pfd == 2)      k_ink_pf_pack_q<2><<<dim3(kInkHeads, gy), 128, 0, st>>>(d_q, d_pf_q, M, q0, C, pf_gqa_pack);
+                    else if (pfd == 1) k_ink_pf_pack_q<1><<<dim3(kInkHeads, gy), 128, 0, st>>>(d_q, d_pf_q, M, q0, C, pf_gqa_pack);
+                    else               k_ink_pf_pack_q<0><<<dim3(kInkHeads, gy), 128, 0, st>>>(d_q, d_pf_q, M, q0, C, pf_gqa_pack);
                 };
                 auto pf_pack_kv = [&](int kt, int Kt) {
-                    if (pfd == 2)      k_ink_pf_pack_kv<2><<<dim3(kInkKVHeads, Kt), 128, 0, st>>>(kv_desc[visit], slot0, kt, Kt, d_pf_k, d_pf_v);
-                    else if (pfd == 1) k_ink_pf_pack_kv<1><<<dim3(kInkKVHeads, Kt), 128, 0, st>>>(kv_desc[visit], slot0, kt, Kt, d_pf_k, d_pf_v);
-                    else               k_ink_pf_pack_kv<0><<<dim3(kInkKVHeads, Kt), 128, 0, st>>>(kv_desc[visit], slot0, kt, Kt, d_pf_k, d_pf_v);
+                    const int ncopy = pf_gqa_pack ? 1 : 3;
+                    if (pfd == 2)      k_ink_pf_pack_kv<2><<<dim3(kInkKVHeads, Kt), 128, 0, st>>>(kv_desc[visit], slot0, kt, Kt, ncopy, d_pf_k, d_pf_v);
+                    else if (pfd == 1) k_ink_pf_pack_kv<1><<<dim3(kInkKVHeads, Kt), 128, 0, st>>>(kv_desc[visit], slot0, kt, Kt, ncopy, d_pf_k, d_pf_v);
+                    else               k_ink_pf_pack_kv<0><<<dim3(kInkKVHeads, Kt), 128, 0, st>>>(kv_desc[visit], slot0, kt, Kt, ncopy, d_pf_k, d_pf_v);
                 };
-                pf_pack_q();
-                attn_mark(1, M, 0);
+                if (!pf_gqa_pack) {
+                    pf_pack_q(0, M);
+                    attn_mark(1, M, 0);
+                }
 
                 constexpr int Q_CH = 256;
                 const float sc_qk = 0.08838834764831845f;
                 const float one = 1.0f, zero = 0.0f;
-                // PV: O = P(C x K_t) @ V(K_t x head_dim)。shape 1 は m/n を入れ替えるので O^T が返り、
-                // 直後に k_ink_pf_ot_to_o で通常レイアウトへ戻す (転置のコストも PV 区間に含める)
-                auto pf_pv_gemm = [&](int C, int K_t, long long vstride, const void* pv_v, const void* pv_p, float* pv_o) {
-                    if (pf_pv_shape == 1) {
+                // QK: S = K^T Q。gqa=1 は KV head 8 本を 1 batch にまとめ n=3C にするので、K の読みが 3 分の 1 になる
+                // (B の Q は pf_pack_q が [8, 3C, 128] に並べたもの。batch ごとに 3 head ぶんが連続する)
+                auto pf_qk_gemm = [&](int q0, int C, int Kt, long long kstride, const void* qk_k, float* qk_s) {
+                    if (pf_gqa_pack) {
                         INK_CUBLAS_CK(cublasGemmStridedBatchedEx(
-                            cublas, CUBLAS_OP_T, CUBLAS_OP_T,
-                            C, kInkHeadDim, K_t, &one,
-                            pv_p, pf_dt, K_t, (long long)C * K_t,
-                            pv_v, pf_dt, kInkHeadDim, vstride,
-                            &zero, pv_o, CUDA_R_32F, C, (long long)C * kInkHeadDim,
+                            cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                            Kt, 3 * C, kInkHeadDim, &sc_qk,
+                            qk_k, pf_dt, kInkHeadDim, kstride,
+                            d_pf_q, pf_dt, kInkHeadDim, (long long)3 * C * kInkHeadDim,
+                            &zero, qk_s, CUDA_R_32F, Kt, (long long)3 * C * Kt,
+                            kInkKVHeads, CUBLAS_COMPUTE_32F, pf_algo));
+                    } else {
+                        INK_CUBLAS_CK(cublasGemmStridedBatchedEx(
+                            cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                            Kt, C, kInkHeadDim, &sc_qk,
+                            qk_k, pf_dt, kInkHeadDim, kstride,
+                            pf_off(d_pf_q, (size_t)q0 * kInkHeadDim), pf_dt, kInkHeadDim, (long long)M * kInkHeadDim,
+                            &zero, qk_s, CUDA_R_32F, Kt, (long long)C * Kt,
                             kInkHeads, CUBLAS_COMPUTE_32F, pf_algo));
-                    } else if (pf_pv_shape == 2 && kInkHeads == 3 * kInkKVHeads && kInkHeads == 24) {
+                    }
+                };
+                // PV: O = P(C x K_t) @ V(K_t x head_dim)
+                auto pf_pv_gemm = [&](int C, int K_t, long long vstride, const void* pv_v, const void* pv_p, float* pv_o) {
+                    if (pf_pv_shape == 2 && kInkHeads == 3 * kInkKVHeads) {
                         // GQA 3 複製を n 方向に束ねる: 同じ V を読む 3 head を 1 batch にまとめ、V の読みを 1/3 にする
+                        // GQA_PACK=1 では V が 8 head ぶんしかないので、KV head の間隔はそのまま (vstride)
+                        const long long pv_vs = pf_gqa_pack ? vstride : 3 * vstride;
                         INK_CUBLAS_CK(cublasGemmStridedBatchedEx(
                             cublas, CUBLAS_OP_N, CUBLAS_OP_N,
                             kInkHeadDim, 3 * C, K_t, &one,
-                            pv_v, pf_dt, kInkHeadDim, 3 * vstride,
+                            pv_v, pf_dt, kInkHeadDim, pv_vs,
                             pv_p, pf_dt, K_t, (long long)3 * C * K_t,
                             &zero, pv_o, CUDA_R_32F, kInkHeadDim, (long long)3 * C * kInkHeadDim,
                             kInkKVHeads, CUBLAS_COMPUTE_32F, pf_algo));
@@ -3509,25 +3539,18 @@ struct InkCudaRunner {
                         const int k_sub_end = p0_val + q0 + C;
                         const int k_off = k_sub_beg - k_start;
                         const int K_sub = std::max(1, k_sub_end - k_sub_beg);
-                        INK_CUBLAS_CK(cublasGemmStridedBatchedEx(
-                            cublas, CUBLAS_OP_T, CUBLAS_OP_N,
-                            K_sub, C, kInkHeadDim, &sc_qk,
-                            pf_off(d_pf_k, (size_t)k_off * kInkHeadDim), pf_dt, kInkHeadDim, (long long)K_len * kInkHeadDim,
-                            pf_off(d_pf_q, (size_t)q0 * kInkHeadDim), pf_dt, kInkHeadDim, (long long)M * kInkHeadDim,
-                            &zero, d_pf_s, CUDA_R_32F, K_sub, (long long)C * K_sub,
-                            kInkHeads, CUBLAS_COMPUTE_32F, pf_algo));
+                        if (pf_gqa_pack) {   // Q を q ブロック単位の GQA 束ねレイアウトで pack してから QK
+                            pf_pack_q(q0, C);
+                            attn_mark(1, C, 0);
+                        }
+                        pf_qk_gemm(q0, C, K_sub, (long long)K_len * kInkHeadDim, pf_off(d_pf_k, (size_t)k_off * kInkHeadDim), d_pf_s);
                         attn_mark(3, C, K_sub);
                         pf_softmax_rel(q0, C, k_sub_beg, K_sub);
                         attn_mark(4, C, K_sub);
                         // 短い経路は K 全体が 1 tile なので、V のオフセットは k_off だけで表せる
                         pf_pv_gemm(C, K_sub, (long long)K_len * kInkHeadDim, pf_off(d_pf_v, (size_t)k_off * kInkHeadDim), d_pf_p, d_pf_ot);
-                        float* pv_out = d_pf_ot;
-                        if (pf_pv_shape == 1) {
-                            k_ink_pf_ot_to_o<<<dim3(kInkHeads, (C + 31) / 32), 128, 0, st>>>(d_pf_ot, d_pf_o, C);
-                            pv_out = d_pf_o;
-                        }
                         attn_mark(5, C, K_sub);
-                        k_ink_pf_unpack_o_gate<<<dim3(kInkHeads, C), 128, 0, st>>>(pv_out, d_gate_attn, d_attn_out, q0, C);
+                        k_ink_pf_unpack_o_gate<<<dim3(kInkHeads, C), 128, 0, st>>>(d_pf_ot, d_gate_attn, d_attn_out, q0, C);
                         attn_mark(7, C, K_sub);
                     }
                 } else {
@@ -3549,26 +3572,18 @@ struct InkCudaRunner {
                             const bool is_last = (kt + K_t >= k_sub_end);
                             pf_pack_kv(kt, K_t);
                             attn_mark(2, C, K_t);
-                            INK_CUBLAS_CK(cublasGemmStridedBatchedEx(
-                                cublas, CUBLAS_OP_T, CUBLAS_OP_N,
-                                K_t, C, kInkHeadDim, &sc_qk,
-                                d_pf_k, pf_dt, kInkHeadDim, (long long)K_t * kInkHeadDim,
-                                pf_off(d_pf_q, (size_t)q0 * kInkHeadDim), pf_dt, kInkHeadDim, (long long)M * kInkHeadDim,
-                                &zero, d_pf_s, CUDA_R_32F, K_t, (long long)C * K_t,
-                                kInkHeads, CUBLAS_COMPUTE_32F, pf_algo));
+                            if (pf_gqa_pack && kt == k_sub_beg) {   // q ブロックごとに 1 回でよい
+                                pf_pack_q(q0, C);
+                                attn_mark(1, C, 0);
+                            }
+                            pf_qk_gemm(q0, C, K_t, (long long)K_t * kInkHeadDim, d_pf_k, d_pf_s);
                             attn_mark(3, C, K_t);
                             pf_softmax_tile(q0, C, kt, K_t);
                             attn_mark(4, C, K_t);
                             pf_pv_gemm(C, K_t, (long long)K_t * kInkHeadDim, d_pf_v, d_pf_p, d_pf_ot);
-                            float* pv_out = d_pf_ot;
-                            if (pf_pv_shape == 1) {
-                                // d_pf_s は softmax が読み終えた後なので転置の作業先に使える
-                                k_ink_pf_ot_to_o<<<dim3(kInkHeads, (C + 31) / 32), 128, 0, st>>>(d_pf_ot, d_pf_s, C);
-                                pv_out = d_pf_s;
-                            }
                             attn_mark(5, C, K_t);
                             k_ink_pf_accum_tile<<<dim3(kInkHeads, C), 128, 0, st>>>(
-                                pv_out, d_alpha_tmp, d_pf_l, d_pf_o, d_gate_attn, d_attn_out, q0, C, is_last);
+                                d_pf_ot, d_alpha_tmp, d_pf_l, d_pf_o, d_gate_attn, d_attn_out, q0, C, is_last);
                             attn_mark(7, C, K_t);
                         }
                     }
