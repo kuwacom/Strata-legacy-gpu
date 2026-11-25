@@ -1977,6 +1977,92 @@ struct InkCudaRunner {
                     iters, prof_ms[14] / iters, prof_ms[15] / iters);
     }
 
+    // ---- タイル型 prefill attention のステージ別 prof (STRATA_INK_ATTN_PROF=1) ----
+    // 区間ごとに同期すると launch が止まって値そのものが変わるので、同じ stream の event を visit ごとの連鎖で積み、
+    // chunk の終わりに 1 回だけ差分を取る。無効時は各 mark が bool 1 個で戻る
+    // stage: 0=rel_table 1=pack_q 2=pack_kv 3=QK SGEMM 4=softmax 5=PV SGEMM 6=online_init 7=accum/unpack/gate
+    // path: 0=global (長い経路、K_len > 2048) 1=SWA (短い経路、K_len <= 2048)
+    bool attn_prof = false;
+    static constexpr int kAttnStages = 8;
+    struct AttnPair { cudaEvent_t a, b; int stage, path, C, Kt; };
+    std::vector<cudaEvent_t> attn_pool;
+    std::vector<AttnPair> attn_pairs;
+    size_t attn_used = 0;
+    cudaEvent_t attn_prev = nullptr;
+    int attn_path = 0;
+    size_t attn_pairs_begin = 0;
+    double attn_ms[2][kAttnStages] = {};
+    long attn_n[2][kAttnStages] = {};
+    double attn_sum_c[2][kAttnStages] = {};
+    double attn_sum_kt[2][kAttnStages] = {};
+    long attn_visits[2] = {};
+
+    cudaEvent_t attn_next_ev() {
+        if (attn_used == attn_pool.size()) { cudaEvent_t e; INK_CK(cudaEventCreate(&e)); attn_pool.push_back(e); }
+        return attn_pool[attn_used++];
+    }
+    // タイル経路の visit 1 本ぶんの連鎖を開始する (rel_table の直前)
+    void attn_begin(int path) {
+        if (!attn_prof) return;
+        attn_path = path;
+        attn_pairs_begin = attn_pairs.size();
+        ++attn_visits[path];
+        attn_prev = attn_next_ev();
+        INK_CK(cudaEventRecord(attn_prev, st));
+    }
+    // 直前に launch したステージの終端。C と K_t は平均を出すために区間へ紐づける
+    void attn_mark(int stage, int C = 0, int Kt = 0) {
+        if (!attn_prof || !attn_prev) return;
+        cudaEvent_t e = attn_next_ev();
+        INK_CK(cudaEventRecord(e, st));
+        attn_pairs.push_back({attn_prev, e, stage, attn_path, C, Kt});
+        attn_prev = e;
+    }
+    // タイル経路に落ちなかった visit (per-token / decode / verify) は区間を捨てる
+    void attn_abort() {
+        if (!attn_prof || !attn_prev) return;
+        attn_pairs.resize(attn_pairs_begin);
+        --attn_visits[attn_path];
+        attn_prev = nullptr;
+    }
+    // chunk の終わりに 1 回だけ呼ぶ。attn_phase_ms は同じ chunk の attn= 位相 (無効時は -1)
+    void attn_report(int M, int p0, double attn_phase_ms) {
+        if (!attn_prof) return;
+        INK_CK(cudaStreamSynchronize(st));
+        for (const AttnPair& p : attn_pairs) {
+            float ms = 0.0f;
+            INK_CK(cudaEventElapsedTime(&ms, p.a, p.b));
+            attn_ms[p.path][p.stage] += ms;
+            ++attn_n[p.path][p.stage];
+            attn_sum_c[p.path][p.stage] += p.C;
+            attn_sum_kt[p.path][p.stage] += p.Kt;
+        }
+        double sum = 0.0;
+        for (int path = 0; path < 2; ++path)
+            for (int s = 0; s < kAttnStages; ++s) sum += attn_ms[path][s];
+        std::fprintf(stderr, "[PROF attn stages] PREFILL-M%d p0=%d global_visits=%ld swa_visits=%ld | sum=%.2f attn=%.2f diff=%+.2f%% | %zu events (ms/chunk)\n",
+                     M, p0, attn_visits[0], attn_visits[1], sum, attn_phase_ms,
+                     attn_phase_ms > 0.0 ? 100.0 * (sum - attn_phase_ms) / attn_phase_ms : 0.0, attn_pairs.size());
+        static const char* const names[kAttnStages] = {"rel_table", "pack_q", "pack_kv", "QK", "softmax", "PV", "init", "acc"};
+        for (int path = 0; path < 2; ++path) {
+            std::fprintf(stderr, "[PROF attn stages %s]", path == 0 ? "global" : "swa");
+            for (int s = 0; s < kAttnStages; ++s) {
+                const long n = attn_n[path][s];
+                std::fprintf(stderr, " %s=%.2f[%ld", names[s], attn_ms[path][s], n);
+                if (n > 0) std::fprintf(stderr, ",C%.0f,Kt%.0f", attn_sum_c[path][s] / (double)n, attn_sum_kt[path][s] / (double)n);
+                std::fprintf(stderr, "]");
+            }
+            std::fprintf(stderr, " (ms/chunk)\n");
+        }
+        for (int path = 0; path < 2; ++path) {
+            for (int s = 0; s < kAttnStages; ++s) { attn_ms[path][s] = 0.0; attn_sum_c[path][s] = 0.0; attn_sum_kt[path][s] = 0.0; attn_n[path][s] = 0; }
+            attn_visits[path] = 0;
+        }
+        attn_pairs.clear();
+        attn_used = 0;
+        attn_prev = nullptr;
+    }
+
     static size_t kv_bytes_per_visit_pos(InkKvDtype dt) noexcept {
         if (dt == InkKvDtype::FP16) return (size_t)kInkKVDim * 4u;
         if (dt == InkKvDtype::K8V4) return (size_t)kInkKVDim + ((size_t)kInkKVDim / 2u) + (size_t)(2 * kInkKVHeads * 4);
@@ -2124,6 +2210,8 @@ struct InkCudaRunner {
         }
         // 安全弁: STRATA_INK_PF_TILE=0 でタイル型 prefill attention を止め、従来の per-token 経路 (k_ink_flash_gqa_gqa3) に戻す
         if (const char* pt = std::getenv("STRATA_INK_PF_TILE"); pt && pt[0] == '0') pf_tile_enabled = false;
+        // 計測専用: STRATA_INK_ATTN_PROF=1 でタイル型 prefill attention のステージ別 event を取る (既定 off = ゼロオーバーヘッド)
+        if (const char* ap = std::getenv("STRATA_INK_ATTN_PROF"); ap && ap[0] == '1') attn_prof = true;
         INK_CK(cudaStreamCreate(&st));
         INK_CK(cudaEventCreate(&ev_p0));
         INK_CK(cudaEventCreate(&ev_p1));
@@ -3324,8 +3412,11 @@ struct InkCudaRunner {
         {
             const int cur_cc = m.ls_active ? m.stage_cc[cur_stage] : m.sm_cc;
             dim3 gr(kInkHeads, M);
+            if (mode == 0 && M >= 128) attn_begin(is_swa ? 1 : 0);   // STRATA_INK_ATTN_PROF=1: タイル経路の visit 単位の計測
             k_ink_rel_table<<<gr, 256, 0, st>>>(d_r, (const float*)m.trunk_ptr_stage(cur_stage, p + ".attn.rel_logits_proj.proj"), d_rel_table, M);
+            attn_mark(0, M, 0);
             if (M <= 16 || mode == 2) {
+                attn_abort();   // per-token / decode / verify の visit は計測対象外
                 // #6671: a verify tree uses the one-token step's split count, so row m is the value the step at that position gives (the key split, the
                 // warp walk and the merge are the same; only the count differed: 8 for M > 1 against 16 / 32 for M == 1)
                 const int n_sp = (M == 1 || mode == 2) ? (is_swa ? 16 : kInkAttnMaxSplits) : kInkAttnSplits;
@@ -3362,6 +3453,7 @@ struct InkCudaRunner {
                     else               k_ink_pf_pack_kv<0><<<dim3(kInkKVHeads, Kt), 128, 0, st>>>(kv_desc[visit], slot0, kt, Kt, d_pf_k, d_pf_v);
                 };
                 pf_pack_q();
+                attn_mark(1, M, 0);
 
                 constexpr int Q_CH = 256;
                 const float sc_qk = 0.08838834764831845f;
@@ -3369,6 +3461,7 @@ struct InkCudaRunner {
 
                 if (K_len <= kInkPfKvTile) {
                     pf_pack_kv(k_start, K_len);
+                    attn_mark(2, M, K_len);
                     auto pf_softmax_rel = [&](int q0, int C, int ks, int Kt) {
                         if (pfd == 2)      k_ink_pf_softmax_rel_sink<2><<<dim3(C, kInkHeads), 256, 0, st>>>(d_pf_s, d_rel_table, d_sinks, d_pf_p, q0, C, ks, Kt, p0_val, is_swa);
                         else if (pfd == 1) k_ink_pf_softmax_rel_sink<1><<<dim3(C, kInkHeads), 256, 0, st>>>(d_pf_s, d_rel_table, d_sinks, d_pf_p, q0, C, ks, Kt, p0_val, is_swa);
@@ -3387,7 +3480,9 @@ struct InkCudaRunner {
                             pf_off(d_pf_q, (size_t)q0 * kInkHeadDim), pf_dt, kInkHeadDim, (long long)M * kInkHeadDim,
                             &zero, d_pf_s, CUDA_R_32F, K_sub, (long long)C * K_sub,
                             kInkHeads, CUBLAS_COMPUTE_32F, pf_algo));
+                        attn_mark(3, C, K_sub);
                         pf_softmax_rel(q0, C, k_sub_beg, K_sub);
+                        attn_mark(4, C, K_sub);
                         INK_CUBLAS_CK(cublasGemmStridedBatchedEx(
                             cublas, CUBLAS_OP_N, CUBLAS_OP_N,
                             kInkHeadDim, C, K_sub, &one,
@@ -3395,7 +3490,9 @@ struct InkCudaRunner {
                             d_pf_p, pf_dt, K_sub, (long long)C * K_sub,
                             &zero, d_pf_o, CUDA_R_32F, kInkHeadDim, (long long)C * kInkHeadDim,
                             kInkHeads, CUBLAS_COMPUTE_32F, pf_algo));
+                        attn_mark(5, C, K_sub);
                         k_ink_pf_unpack_o_gate<<<dim3(kInkHeads, C), 128, 0, st>>>(d_pf_o, d_gate_attn, d_attn_out, q0, C);
+                        attn_mark(7, C, K_sub);
                     }
                 } else {
                     // Long-context KV-Tiled Online-Softmax TC Attention (K_len > 2048 -> O(1) 114 MiB VRAM forever!)
@@ -3410,10 +3507,12 @@ struct InkCudaRunner {
                         const int k_sub_beg = is_swa ? std::max(k_start, p0_val + q0 - kInkSwaWin + 1) : k_start;
                         const int k_sub_end = p0_val + q0 + C;
                         k_ink_pf_online_init<<<dim3(kInkHeads, C), 128, 0, st>>>(d_sinks, d_pf_m, d_pf_l, d_pf_o, q0, C);
+                        attn_mark(6, C, 0);
                         for (int kt = k_sub_beg; kt < k_sub_end; kt += kInkPfKvTile) {
                             const int K_t = std::min(kInkPfKvTile, k_sub_end - kt);
                             const bool is_last = (kt + K_t >= k_sub_end);
                             pf_pack_kv(kt, K_t);
+                            attn_mark(2, C, K_t);
                             INK_CUBLAS_CK(cublasGemmStridedBatchedEx(
                                 cublas, CUBLAS_OP_T, CUBLAS_OP_N,
                                 K_t, C, kInkHeadDim, &sc_qk,
@@ -3421,7 +3520,9 @@ struct InkCudaRunner {
                                 pf_off(d_pf_q, (size_t)q0 * kInkHeadDim), pf_dt, kInkHeadDim, (long long)M * kInkHeadDim,
                                 &zero, d_pf_s, CUDA_R_32F, K_t, (long long)C * K_t,
                                 kInkHeads, CUBLAS_COMPUTE_32F, pf_algo));
+                            attn_mark(3, C, K_t);
                             pf_softmax_tile(q0, C, kt, K_t);
+                            attn_mark(4, C, K_t);
                             INK_CUBLAS_CK(cublasGemmStridedBatchedEx(
                                 cublas, CUBLAS_OP_N, CUBLAS_OP_N,
                                 kInkHeadDim, C, K_t, &one,
@@ -3429,12 +3530,16 @@ struct InkCudaRunner {
                                 d_pf_p, pf_dt, K_t, (long long)C * K_t,
                                 &zero, d_pf_ot, CUDA_R_32F, kInkHeadDim, (long long)C * kInkHeadDim,
                                 kInkHeads, CUBLAS_COMPUTE_32F, pf_algo));
+                            attn_mark(5, C, K_t);
                             k_ink_pf_accum_tile<<<dim3(kInkHeads, C), 128, 0, st>>>(
                                 d_pf_ot, d_alpha_tmp, d_pf_l, d_pf_o, d_gate_attn, d_attn_out, q0, C, is_last);
+                            attn_mark(7, C, K_t);
                         }
                     }
                 }
+                attn_prev = nullptr;   // visit 完了。次の visit は attn_begin から張り直す (decode 側の abort が前の visit を消さないように)
             } else {
+                attn_abort();
                 // 条件は満たすが作業領域が取れない / STRATA_INK_PF_TILE=0 のときは黙って per-token に落ちる (ログは 1 行だけ)
                 if (mode == 0 && M >= 128 && (cur_cc >= 70 || cur_cc == 60 || cur_cc == 61)) {
                     pf_tile_warn_once(pf_tile_enabled ? "workspace not available" : "STRATA_INK_PF_TILE=0");
@@ -3743,6 +3848,8 @@ struct InkCudaRunner {
         if (prof_enabled) {   // STRATA_INK_PROF=1: where one decode step goes (eager, events only), every 100 steps
             prof_flush();
             if (M != 1) {
+                // STRATA_INK_ATTN_PROF=1: 同じ chunk の attn= 位相と突き合わせるため prof_reset の前に出す
+                attn_report(M, p0, prof_ms[3]);
                 if (prof_prefill && M >= 64) {   // STRATA_INK_PROF=2: one line per prefill chunk (the phases of this chunk, ms)
                     char tag[32];
                     std::snprintf(tag, sizeof(tag), "PREFILL-M%d", M);
@@ -3751,6 +3858,8 @@ struct InkCudaRunner {
                 prof_reset();
             }
             else if (++prof_steps % 100 == 0) { prof_print("DECODE-M1", (int)prof_steps); prof_steps = 0; prof_reset(); }
+        } else if (attn_prof && M != 1) {
+            attn_report(M, p0, -1.0);   // STRATA_INK_PROF 無しでもステージ別だけは取れるようにする
         }
     }
 
