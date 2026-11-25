@@ -10,6 +10,7 @@
 // 重み 1 sub-block 先行ロード版 (旧 OCC=2) は MLP が増えないまま 4.4% 遅かったため削除した
 //
 // SQ-10 の S_K は S2_K / S3_K だけなので実体はこの 2 形式のみ。他の形式と mask==0 は従来カーネルへ委譲する
+// STRATA_INK_SK_DN_SMEM (既定 1) は MAX_M==16 の dn 活性を shared にステージする (0 で global 直読に戻る)
 // 注: このヘッダは ink_moe_cuda.cuh の namespace strata::ink の内側で include される
 #pragma once
 
@@ -19,11 +20,12 @@ inline int ink_sk_occ_mode() {
     return mode;
 }
 
-// dn の活性 (h_sk) を shared にステージするか (既定 0 = 従来どおり global 直読)。
+// dn の活性 (h_sk) を shared にステージするか (既定 1 = shared ステージ、0 = 従来どおり global 直読)。
 // MAX_M==16 でだけ効く: 16 token x 18 block x 80 B = 22.5 KiB/CTA で、4 CTA/SM でも 90 KiB に収まる。
-// コピーは 16 B 単位のそのままの複製なので、値も演算順も変わらず y_pair は bit 一致する
+// コピーは 16 B 単位のそのままの複製なので、値も演算順も変わらず y_pair は bit 一致する。
+// 実測 (SQ-10 / P40): dn(sk) 308.60 -> 196.66 ms/step、32K prefill +6.0%、128K prefill +4.6%
 inline int ink_sk_dn_smem_mode() {
-    static const int mode = [] { const char* e = std::getenv("STRATA_INK_SK_DN_SMEM"); return e ? (std::atoi(e) != 0 ? 1 : 0) : 0; }();
+    static const int mode = [] { const char* e = std::getenv("STRATA_INK_SK_DN_SMEM"); return e ? (std::atoi(e) != 0 ? 1 : 0) : 1; }();
     return mode;
 }
 
