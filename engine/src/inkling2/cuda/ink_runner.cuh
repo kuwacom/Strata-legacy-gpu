@@ -382,6 +382,9 @@ struct InkCudaModel {
                     moe_info[il].has_sk = true;
                     moe_info[il].sk_dn_mask |= (1u << e.dn_code_id);
                 }
+                // code は層で固定なので、SF4/MX8 の実在 expert 数は host で数えられる (SF4_COMPACT の grid.y 上限)
+                if (e.gu_code_id == FMT_SF4 || e.gu_code_id == FMT_MX8) ++moe_info[il].n_gu_fmt;
+                if (e.dn_code_id == FMT_SF4 || e.dn_code_id == FMT_MX8) ++moe_info[il].n_dn_fmt;
             }
         }
 
@@ -1533,6 +1536,9 @@ struct InkCudaModel {
                     mi.has_sk = true;
                     mi.sk_dn_mask |= (1u << dn_code);
                 }
+                // SF4/MX8 の実在 expert 数 (SF4_COMPACT の grid.y 上限)
+                if (gu_code == FMT_SF4 || gu_code == FMT_MX8) ++mi.n_gu_fmt;
+                if (dn_code == FMT_SF4 || dn_code == FMT_MX8) ++mi.n_dn_fmt;
             };
             const int own_s = ls_active ? layer_owner[il] : 0;
             const int own_gpu = ls_active ? stage_gpu[own_s] : primary_gpu;

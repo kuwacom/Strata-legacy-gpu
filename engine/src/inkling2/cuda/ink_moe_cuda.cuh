@@ -107,6 +107,9 @@ struct InkMoeWorkspace {
         const size_t o_off     = bump(129 * 4);
         const size_t o_act     = bump(128 * 4);
         const size_t o_nact    = bump(16);
+        const size_t o_act_gu  = bump(128 * 4);
+        const size_t o_act_dn  = bump(128 * 4);
+        const size_t o_nact_fix = bump(32);
         const size_t o_pairs   = bump(P * 4);
         const size_t o_tok     = bump(P * 4);
         const size_t o_ntiles  = bump(16);
@@ -137,6 +140,10 @@ struct InkMoeWorkspace {
         tb.off     = (int32_t*)(base + o_off);
         tb.active  = (int32_t*)(base + o_act);
         tb.nact    = (int32_t*)(base + o_nact);
+        tb.active_gu = (int32_t*)(base + o_act_gu);
+        tb.active_dn = (int32_t*)(base + o_act_dn);
+        tb.nact_gu   = (int32_t*)(base + o_nact_fix);
+        tb.nact_dn   = (int32_t*)(base + o_nact_fix + 16);
         tb.pairs   = (int32_t*)(base + o_pairs);
         tb.tok_idx = (int32_t*)(base + o_tok);
         tb.n_tiles = (int32_t*)(base + o_ntiles);
@@ -343,6 +350,19 @@ __global__ void __launch_bounds__(128) k_ink_moe_bin(
         const int pos = s_off[e] + atomicAdd(&s_fill[e], 1);
         tb.pairs[pos] = i;
         tb.tok_idx[pos] = i / kInkTopK;
+    }
+
+    // SF4/MX8 の実在 expert だけの compact リスト (STRATA_INK_SF4_COMPACT が grid.y をこれに絞る)
+    // 1 block 128 thread のカーネルなので、prefix sum を増やさず thread 0 の直列走査で作る (128 回)
+    if (t == 0) {
+        int kg = 0, kd = 0;
+        for (int i = 0; i < 128; ++i) {
+            if (s_cnt[i] <= 0) continue;   // 未ルーティング (tier>1 で除外された pair のみ) は載せない
+            if (ex[i].gu_code == FMT_SF4 || ex[i].gu_code == FMT_MX8) tb.active_gu[kg++] = i;
+            if (ex[i].dn_code == FMT_SF4 || ex[i].dn_code == FMT_MX8) tb.active_dn[kd++] = i;
+        }
+        *tb.nact_gu = kg;
+        *tb.nact_dn = kd;
     }
 }
 
@@ -1357,10 +1377,12 @@ __global__ void __launch_bounds__(128) k_ink_moe_gu_sf4_mx8(
     const InkExpertDev* __restrict__ experts,
     InkMoeTables tb,
     const float* __restrict__ x_f32,          // [M, 2304]
-    float* __restrict__ h_f32) {              // [P, 1152]
+    float* __restrict__ h_f32,                // [P, 1152]
+    const int32_t* __restrict__ e_list,       // 実行する expert id 列 (従来 = tb.active、SF4_COMPACT = active_gu)
+    const int* __restrict__ n_list) {         // e_list の要素数 (従来 = tb.nact、SF4_COMPACT = nact_gu)
     const int ai = blockIdx.y;
-    if (ai >= *tb.nact) return;
-    const int e = tb.active[ai];
+    if (ai >= *n_list) return;
+    const int e = e_list[ai];
     const int row0 = tb.off[e];
     const int n_total = tb.cnt[e];
     const InkExpertDev ed = experts[e];
@@ -1540,10 +1562,12 @@ __global__ void __launch_bounds__(128) k_ink_moe_dn_sf4_mx8(
     InkMoeTables tb,
     const float* __restrict__ h_f32,          // [P, 1152]
     const float* __restrict__ topk_w,         // [P]
-    float* __restrict__ y_pair) {             // [P, 2304]
+    float* __restrict__ y_pair,               // [P, 2304]
+    const int32_t* __restrict__ e_list,       // 実行する expert id 列 (従来 = tb.active、SF4_COMPACT = active_dn)
+    const int* __restrict__ n_list) {         // e_list の要素数 (従来 = tb.nact、SF4_COMPACT = nact_dn)
     const int ai = blockIdx.y;
-    if (ai >= *tb.nact) return;
-    const int e = tb.active[ai];
+    if (ai >= *n_list) return;
+    const int e = e_list[ai];
     const int row0 = tb.off[e];
     const int n_total = tb.cnt[e];
     const InkExpertDev ed = experts[e];
@@ -3593,6 +3617,8 @@ struct InkLayerMoeInfo {
     bool has_gguf = false;
     uint32_t sk_gu_mask = 0;
     uint32_t sk_dn_mask = 0;
+    int n_gu_fmt = 0;   // この層の SF4/MX8 gate+up expert 数 (STRATA_INK_SF4_COMPACT の grid.y 上限)
+    int n_dn_fmt = 0;   // この層の SF4/MX8 down expert 数
 };
 
 #include "ink_moe_prefill.cuh"   // k_ink_moe_pf_fp16tc: the 64-token-tile prefill MoE (sm_80..89), see the header
@@ -3767,16 +3793,31 @@ inline void launch_ink_moe_dispatch_only(
                 ink_moe_mark(3);
             }
         } else {
-            dim3 g16(kInkInter / 16, max_act);
+            // STRATA_INK_SF4_COMPACT=1 (default): y は「この層の SF4/MX8 expert」だけ。bin が既に作った compact リストを
+            // そのまま渡すので、従来の「全 active expert を出して 98% が format 不一致で空 return」が消える。
+            // 1 expert あたりの block 数・演算・書き込み先は同一 = 結果は bit 一致
+            static const bool sf4_compact = [] {
+                const char* e = std::getenv("STRATA_INK_SF4_COMPACT");
+                return !(e && e[0] == '0');
+            }();
+            const bool cgu = sf4_compact && info.n_gu_fmt > 0;
+            const bool cdn = sf4_compact && info.n_dn_fmt > 0;
+            const int ny_gu = cgu ? std::min(max_act, info.n_gu_fmt) : max_act;
+            const int ny_dn = cdn ? std::min(max_act, info.n_dn_fmt) : max_act;
+            const int32_t* lgu = cgu ? ws.tb.active_gu : ws.tb.active;
+            const int32_t* ldn = cdn ? ws.tb.active_dn : ws.tb.active;
+            const int* ngu_p = cgu ? ws.tb.nact_gu : ws.tb.nact;
+            const int* ndn_p = cdn ? ws.tb.nact_dn : ws.tb.nact;
+            dim3 g16(kInkInter / 16, ny_gu), g16d(kInkInter / 16, ny_dn);
             if (M == 1) {
-                k_ink_moe_gu_sf4_mx8<1><<<g16, 128, 0, st>>>(sec4_base, experts, ws.tb, x_f32, ws.h_f32);
+                k_ink_moe_gu_sf4_mx8<1><<<g16, 128, 0, st>>>(sec4_base, experts, ws.tb, x_f32, ws.h_f32, lgu, ngu_p);
                 ink_moe_mark(2);
-                k_ink_moe_dn_sf4_mx8<1><<<g16, 128, 0, st>>>(sec4_base, experts, ws.tb, ws.h_f32, ws.topk_w, ws.y_pair);
+                k_ink_moe_dn_sf4_mx8<1><<<g16d, 128, 0, st>>>(sec4_base, experts, ws.tb, ws.h_f32, ws.topk_w, ws.y_pair, ldn, ndn_p);
                 ink_moe_mark(3);
             } else {
-                k_ink_moe_gu_sf4_mx8<4><<<g16, 128, 0, st>>>(sec4_base, experts, ws.tb, x_f32, ws.h_f32);
+                k_ink_moe_gu_sf4_mx8<4><<<g16, 128, 0, st>>>(sec4_base, experts, ws.tb, x_f32, ws.h_f32, lgu, ngu_p);
                 ink_moe_mark(2);
-                k_ink_moe_dn_sf4_mx8<4><<<g16, 128, 0, st>>>(sec4_base, experts, ws.tb, ws.h_f32, ws.topk_w, ws.y_pair);
+                k_ink_moe_dn_sf4_mx8<4><<<g16d, 128, 0, st>>>(sec4_base, experts, ws.tb, ws.h_f32, ws.topk_w, ws.y_pair, ldn, ndn_p);
                 ink_moe_mark(3);
             }
         }

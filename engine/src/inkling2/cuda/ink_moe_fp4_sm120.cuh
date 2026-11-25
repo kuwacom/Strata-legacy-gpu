@@ -31,6 +31,10 @@ struct InkMoeTables {
     int32_t* tok_idx;   // [P] source token index for each sorted pair
     int32_t* n_tiles;   // [1] total 64-row tiles across all active experts
     int2*    tiles;     // [max_tiles] {.x = expert_id, .y = pair_row0}
+    int32_t* active_gu; // [128] SF4/MX8 gate+up experts routed in this visit (compact, ascending expert id)
+    int32_t* active_dn; // [128] SF4/MX8 down experts routed in this visit (compact, ascending expert id)
+    int32_t* nact_gu;   // [1] count of active_gu
+    int32_t* nact_dn;   // [1] count of active_dn
 };
 
 namespace sm120 {
