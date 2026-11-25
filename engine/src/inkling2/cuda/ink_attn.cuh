@@ -1094,6 +1094,33 @@ __global__ void __launch_bounds__(256) k_ink_pf_softmax_tile_online(
     }
 }
 
+// PV を m=C / n=head_dim の向きで積んだときの O^T [24, 128, C] を通常の O [24, C, 128] に直す
+// (m/n を入れ替えると出力が転置になるため、既存の accum / unpack をそのまま使うには 1 回の転置が要る)
+__global__ void __launch_bounds__(128) k_ink_pf_ot_to_o(
+    const float* __restrict__ o_t,        // [24, 128, C] 列優先 (d が行、ci が列)
+    float* __restrict__ o,                // [24, C, 128]
+    int C) {
+    __shared__ float sh[32][129];         // [ci_local][d] (+1 でバンク衝突を避ける)
+    const int h = blockIdx.x;
+    const int ci0 = blockIdx.y * 32;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;    // 4 warp で d を 32 本ずつ分担する
+    const float* src = o_t + (size_t)h * kInkHeadDim * C;
+    for (int dd = 0; dd < 32; ++dd) {
+        const int d = warp * 32 + dd;
+        const int ci = ci0 + lane;
+        sh[lane][d] = (ci < C) ? src[(size_t)d * C + ci] : 0.0f;   // ci 方向に連続 -> coalesced
+    }
+    __syncthreads();
+    float* dst = o + (size_t)h * C * kInkHeadDim;
+    for (int cl = 0; cl < 32; ++cl) {
+        const int ci = ci0 + cl;
+        if (ci >= C) break;
+        const int d = warp * 32 + lane;
+        dst[(size_t)ci * kInkHeadDim + d] = sh[cl][d];
+    }
+}
+
 __global__ void __launch_bounds__(128) k_ink_pf_accum_tile(
     const float* __restrict__ o_tile,     // [24, C, 128]
     const float* __restrict__ alpha_in,   // [24, C]
