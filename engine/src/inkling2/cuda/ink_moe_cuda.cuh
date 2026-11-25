@@ -1980,6 +1980,9 @@ __device__ __forceinline__ void sk_dn_paired2_4lane(
     }
 }
 
+// S_K MoE (gu/dn) の occupancy / 重み先行ロード実験用バリアント (STRATA_INK_SK_OCC、既定 0 = 従来)
+#include "ink_moe_sk_occ.cuh"
+
 // Grid: (1152 / 32 = 36, max_act), Block: 128 (32 features/CTA, 4 lanes/feature -> 100% coalesced, 0 inner shuffles!)
 template <int MAX_M>
 __global__ void __launch_bounds__(128) k_ink_moe_gu_sk(
@@ -3629,6 +3632,8 @@ inline void launch_ink_moe_gu_sk_mask(
     const uint8_t* sec4_base, const InkExpertDev* experts, InkMoeTables tb,
     const InkQ8_1_G64* x_sk, float* h_f32) {
     if (mask == 0) { k_ink_moe_gu_sk<MAX_M><<<grid, 128, 0, st>>>(sec4_base, experts, tb, x_sk, h_f32); return; }
+    // STRATA_INK_SK_OCC=1|2 (実験用)。既定 0 はこの行を素通りして従来カーネルへ
+    if (launch_ink_moe_gu_sk_occ<MAX_M>(grid, st, mask, sec4_base, experts, tb, x_sk, h_f32)) return;
     if (mask & (1u << FMT_S1_5)) k_ink_moe_gu_sk_fmt<FMT_S1_5, MAX_M><<<grid, 128, 0, st>>>(sec4_base, experts, tb, x_sk, h_f32);
     if (mask & (1u << FMT_S2_K)) k_ink_moe_gu_sk_fmt<FMT_S2_K, MAX_M><<<grid, 128, 0, st>>>(sec4_base, experts, tb, x_sk, h_f32);
     if (mask & (1u << FMT_S3_K)) k_ink_moe_gu_sk_fmt<FMT_S3_K, MAX_M><<<grid, 128, 0, st>>>(sec4_base, experts, tb, x_sk, h_f32);
@@ -3644,6 +3649,8 @@ inline void launch_ink_moe_dn_sk_mask(
     const uint8_t* sec4_base, const InkExpertDev* experts, InkMoeTables tb,
     const InkQ8_1_G64* h_sk, const float* topk_w, float* y_pair) {
     if (mask == 0) { k_ink_moe_dn_sk<MAX_M><<<grid, 128, 0, st>>>(sec4_base, experts, tb, h_sk, topk_w, y_pair); return; }
+    // STRATA_INK_SK_OCC=1|2 (実験用)。既定 0 はこの行を素通りして従来カーネルへ
+    if (launch_ink_moe_dn_sk_occ<MAX_M>(grid, st, mask, sec4_base, experts, tb, h_sk, topk_w, y_pair)) return;
     if (mask & (1u << FMT_S1_5)) k_ink_moe_dn_sk_fmt<FMT_S1_5, MAX_M><<<grid, 128, 0, st>>>(sec4_base, experts, tb, h_sk, topk_w, y_pair);
     if (mask & (1u << FMT_S2_K)) k_ink_moe_dn_sk_fmt<FMT_S2_K, MAX_M><<<grid, 128, 0, st>>>(sec4_base, experts, tb, h_sk, topk_w, y_pair);
     if (mask & (1u << FMT_S3_K)) k_ink_moe_dn_sk_fmt<FMT_S3_K, MAX_M><<<grid, 128, 0, st>>>(sec4_base, experts, tb, h_sk, topk_w, y_pair);
