@@ -186,12 +186,13 @@ Tesla P40 1 枚 (24 GB, sm_61) で Inkling-2-Mini SQ-10 を動かし、prefill �
 
 | 文脈 | 起点 (tok/s) | 最終 (tok/s) | 差 |
 |---|---:|---:|---:|
-| 32K | 178.6 | 258.1 | +79.5 |
-| 128K | 94.6 | 202.4 | +107.8 |
-| 512K | 97.6 | 111.8 | +14.2 |
+| 32K | 178.6 | 274.2 | +95.6 |
+| 128K | 94.6 | 212.4 | +117.8 |
+| 512K | 97.6 | 114.2 | +16.6 |
 
-- 32K は 126.96 s、512K は 4,691.47 s。128K は FP16 KV、512K は `--kv k8v4 --kv-offload off`
+- 32K は 119.50 s、512K は 4,592.52 s (前回 32K 126.96 s、512K 4,691.47 s)。128K は FP16 KV、512K は `--kv k8v4 --kv-offload off`
 - 512K の decode は 5.2 tok/s (draft dspark) で、draft off の過去値 7.5 より遅い。prefill の改善とは別扱い
+- 512K の最新は draft off で 4,593 s、decode 7.7 tok/s、host スピルなし、VRAM ピーク 17.5 GB (17,499 MiB)
 - 起点は upstream 0.2.21 の移植直後 (32K と 128K は素の fork、512K は同じ k8v4 構成)
 
 ### 施策
@@ -200,6 +201,7 @@ Tesla P40 1 枚 (24 GB, sm_61) で Inkling-2-Mini SQ-10 を動かし、prefill �
 - PV SGEMM の形状バリアント。既定 `STRATA_INK_PV_SHAPE=2` (0 で従来形)
 - GQA pack の複製削減。既定 `STRATA_INK_GQA_PACK=1` (pack_kv を 3 -> 1 コピー、QK/PV を batch=8)
 - S_K MoE の occupancy 版。既定 `STRATA_INK_SK_OCC=1`
+- S_K dn の活性 shared 化。既定 `STRATA_INK_SK_DN_SMEM=1` (dn -36%、bit 一致)
 - SF4 MoE の起動を実在 expert に限定。既定 `STRATA_INK_SF4_COMPACT=1`
 - MoE MMQ の復活 (`-DSTRATA_MMQ=ON`、opt-in)。移植 5 段には QSA value 8 CTA/SM と
   hyper-connection の BF16 down/inject も含む
@@ -212,9 +214,12 @@ Tesla P40 1 枚 (24 GB, sm_61) で Inkling-2-Mini SQ-10 を動かし、prefill �
 1. `port/upstream-0.2.21` (5 コミット)
 2. `perf/mmq-revival` (1 コミット)
 3. `perf/ink-final` (9 コミット)
+4. `perf/ink-dn-shared` (1 コミット)
+5. `perf/ink-final2` (1 コミット)
 
 この 3 つを `inkling` に取り込むと 15 コミット。`perf/ink-final` とのツリー差は
-移植分と MMQ 分だけ。
+移植分と MMQ 分だけ。`perf/ink-dn-shared` と `perf/ink-final2` を足すと 17 コミットになり、
+`perf/ink-final2` とのツリー差は移植分と MMQ 分と docs だけになる。
 
 ### 文書一覧
 
@@ -229,6 +234,8 @@ Tesla P40 1 枚 (24 GB, sm_61) で Inkling-2-Mini SQ-10 を動かし、prefill �
 結果:
 
 - `ink-final.md` - 最終構成の 32K / 512K
+- `ink-final2.md` - dn shared 既定化後の 512K (draft off) と 32K / 128K
+- `dn-smem.md` - S_K dn の活性 shared 化
 - `attn-stages.md` - attention のステージ別内訳 (128K / 512K)
 - `attn-pv.md` - PV SGEMM の形状バリアント
 - `attn-gqa.md` - GQA pack 削減
