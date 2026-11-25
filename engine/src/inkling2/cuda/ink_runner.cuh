@@ -1832,7 +1832,7 @@ struct InkCudaRunner {
     int pf_elem_cap = 0;          // d_pf_q/k/v/p の 1 要素のバイト数 (2 = BF16/FP16, 4 = FP32)
     bool pf_tile_enabled = true;  // STRATA_INK_PF_TILE=0: タイル型 prefill attention を止めて per-token 経路に戻す
     int pf_pv_shape = 2;          // STRATA_INK_PV_SHAPE: 0 = 従来 (m=128/n=C/batch=24)、2 = KV head 8 本を n=3C で束ねる (既定)
-    int pf_gqa_pack = 0;          // STRATA_INK_GQA_PACK=1: pack_kv の GQA 3 複製をやめ、QK/PV を batch=8 で回す
+    int pf_gqa_pack = 1;          // STRATA_INK_GQA_PACK=0: pack_kv の GQA 3 複製を残し、QK/PV を batch=24 で回す (従来経路)
     int pf_gqa_cap = -1;          // 作業領域を確保したときの pf_gqa_pack
     bool pf_tile_warned = false;  // フォールバックのログは 1 回だけ出す
     float *d_stage_k = nullptr, *d_stage_v = nullptr, *d_stage_sconv = nullptr;  // Tree-16 verify staging
@@ -2222,11 +2222,13 @@ struct InkCudaRunner {
             else if (ps[0] == '1') std::fprintf(stderr, "[InkCUDA] PV SGEMM shape 1 was removed; keeping shape 2\n");
             else if (ps[0] == '2') pf_pv_shape = 2;
         }
-        // GQA pack: 1 で pack_kv の 3 複製をやめる (K/V の書きが 3 分の 1)。QK/PV は batch=8 で回す
-        if (const char* gp = std::getenv("STRATA_INK_GQA_PACK"); gp && gp[0] == '1' && gp[1] == '\0') pf_gqa_pack = 1;
+        // GQA pack (既定 1): pack_kv の GQA 3 複製をやめて K/V を 8 KV head ぶんだけ書き、QK/PV を batch=8 で回す
+        // STRATA_INK_GQA_PACK=0 で従来の 24 head 複製 + batch=24 に戻る
+        if (const char* gp = std::getenv("STRATA_INK_GQA_PACK"); gp && gp[0] == '0' && gp[1] == '\0') pf_gqa_pack = 0;
         if (pf_gqa_pack) pf_pv_shape = 2;   // KV head 8 本しか pack しないので shape 0 (batch=24) は成立しない
         std::fprintf(stderr, "[InkCUDA] PV SGEMM shape = %d\n", pf_pv_shape);
-        if (pf_gqa_pack) std::fprintf(stderr, "[InkCUDA] GQA pack = 1 (pack_kv 3 -> 1 copy, QK/PV batch=8)\n");
+        std::fprintf(stderr, "[InkCUDA] GQA pack = %d (%s)\n", pf_gqa_pack,
+                     pf_gqa_pack ? "pack_kv 3 -> 1 copy, QK/PV batch=8" : "pack_kv 3 copies, QK/PV batch=24");
         INK_CK(cudaStreamCreate(&st));
         INK_CK(cudaEventCreate(&ev_p0));
         INK_CK(cudaEventCreate(&ev_p1));
@@ -3222,7 +3224,7 @@ struct InkCudaRunner {
         pf_elem_cap = 0;
         const size_t esz = (size_t)pf_elem;
         const size_t q_b  = (size_t)kInkHeads * max_batch * kInkHeadDim * esz;
-        // GQA_PACK=1 では K/V を KV head 8 本ぶんしか持たない (24 -> 8 で 2 本あわせて 32 MiB 減)
+        // GQA pack 有効時は K/V を KV head 8 本ぶんしか持たない (24 -> 8 で 2 本あわせて 32 MiB 減)
         const size_t kv_b = (size_t)(pf_gqa_pack ? kInkKVHeads : kInkHeads) * kInkPfKvTile * kInkHeadDim * esz;
         const size_t s_b  = (size_t)kInkHeads * Q_CH * kInkPfKvTile * sizeof(float);
         const size_t p_b  = (size_t)kInkHeads * Q_CH * kInkPfKvTile * esz;
