@@ -1844,6 +1844,8 @@ struct InkCudaRunner {
     float* d_head_f32 = nullptr;           // [V, K] FP32 unembed (STRATA_INK_HEAD_F32=1、sm_61 のみ)
     size_t head_f32_elems = 0;
     int head_f32_state = 0;                // 0=未試行, 1=常駐, -1=断念して従来経路
+    // 既定判定用: 呼び出し側が full logits 経路 (--draft off) のとき true にする。dspark (screen 経路) では false
+    bool head_f32_full_logits = false;
     int8_t* d_xq8 = nullptr;               // activations of a Q8_0 dense GEMM, quantized into the mma B-fragment order (k_ink_quant_x_q8f)
     float*  d_xs8 = nullptr;               // and their scales, one per (token, 32-wide block)
 
@@ -2578,6 +2580,13 @@ struct InkCudaRunner {
                 INK_CK(cudaHostAlloc(&h_ep_y,   MB * kInkHidden * sizeof(float),   cudaHostAllocPortable));
             }
         }
+        // STRATA_INK_HEAD_F32 の既定判定を 1 行だけ出す (dspark 時は確保しない理由もここで分かる)
+        {
+            const char* reason = "";
+            const bool on = head_f32_policy(m.sm_cc, &reason);
+            std::fprintf(stderr, "[InkCUDA] STRATA_INK_HEAD_F32=%d (%s)%s\n", on ? 1 : 0, reason,
+                         on ? ": unembed FP32 を初回の full logits head で常駐" : ": 従来の per-token 変換経路");
+        }
     }
 
     // Elastic Global KV Cache Growth: starts compact (4K..8K) and grows in 8K-token chunks up to max_ctx!
@@ -2952,14 +2961,41 @@ struct InkCudaRunner {
     // 現行経路は毎 token S_K -> BF16 -> FP32 の 2 変換を 66 タイル分行う。ここでは同じ 2 カーネルを
     // 初回だけ通して同じバイト列の FP32 を作るので、SGEMM への入力は現行と bit 一致する
     // (タイル幅・lda・ldY・compute type も変えないこと。変えると bit 一致しない)
+    /**
+     * ### head_f32_policy
+     * STRATA_INK_HEAD_F32 の有効判定と理由を返す
+     *
+     * env が明示されていればそれに従う (sm_70+ の Tensor Core 経路ガードは従来どおり)。
+     * 未指定は sm_61 の単機で full logits 経路のときだけ有効にし、dspark の screen 経路では
+     * FP32 重み 1.72 GiB を無駄に確保しない
+     *
+     * @param cc - 実行する GPU の compute capability
+     * @param reason - 判定理由の文字列を受け取る
+     * @returns 有効なら true
+     */
+    bool head_f32_policy(int cc, const char** reason) const {
+        const char* e = std::getenv("STRATA_INK_HEAD_F32");
+        if (e) {
+            if (std::atoi(e) == 0) { *reason = "env=0"; return false; }
+            // 既存 env の意味は変えない: sm_70+ は FP16/BF16 Tensor Core 経路を維持する
+            if (cc >= 70) { *reason = "env=1 だが sm_70+ は Tensor Core 経路"; return false; }
+            *reason = "env=1"; return true;
+        }
+        if (cc != 61) {
+            *reason = (cc >= 70) ? "sm_70+ (Tensor Core 経路)" : "sm_61 以外";
+            return false;
+        }
+        if (m.ep2_active || m.ls_active) { *reason = "複数 GPU (EP2/LayerSplit)"; return false; }
+        if (!head_f32_full_logits) { *reason = "dspark (screen 経路)"; return false; }
+        *reason = "sm_61 単機 + full logits 経路";
+        return true;
+    }
+
     bool ensure_head_f32(const uint8_t* W, int N, int K, int cc, int fmt) {
-        static const bool enabled = [] {
-            const char* e = std::getenv("STRATA_INK_HEAD_F32");
-            return e && std::atoi(e) != 0;
-        }();
-        if (!enabled || head_f32_state < 0) return false;
+        if (head_f32_state < 0) return false;
         if (head_f32_state == 1) return head_f32_elems == (size_t)N * K;
-        if (cc >= 70) { head_f32_state = -1; return false; }  // sm_70+ は FP16/BF16 Tensor Core 経路を維持する
+        const char* reason = "";
+        if (!head_f32_policy(cc, &reason)) { head_f32_state = -1; return false; }
         const size_t elems = (size_t)N * K;
         size_t free_before = 0, vtot = 0;
         if (ink_cuda_mem_info(&free_before, &vtot) != cudaSuccess) { cudaGetLastError(); return false; }

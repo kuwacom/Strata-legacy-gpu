@@ -302,6 +302,8 @@ public:
         }
         for (;;) {
             runner_ = std::make_unique<strata::ink::InkCudaRunner>(model_);
+            // dspark (screen 経路) では full logits head を通らないので、既定の FP32 常駐を作らない
+            runner_->head_f32_full_logits = !build_screen;
             runner_->use_cuda_graph = vf_graph_ok && !model_.ep2_active && !model_.ls_active;
             if (const char* ng = std::getenv("STRATA_INK_NO_GRAPH"); ng && ng[0] == '1' && runner_->use_cuda_graph) {
                 // diagnostic: launch every kernel of a step eagerly, as the layer-split / EP2 paths always do
