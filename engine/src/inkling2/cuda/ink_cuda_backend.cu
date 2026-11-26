@@ -320,6 +320,16 @@ public:
                 };
                 std::fprintf(stderr, "[InkCUDA] STRATA_INK_PROF=1: eager launches, per-phase timing (runner phases every 50 batched steps, host phases every 32)\n");
             }
+            if (const char* pd = std::getenv("STRATA_INK_DEC_PROF"); pd && pd[0] == '1') {   // decode のステージ別 prof (eager、graph 無効)
+                runner_->dec_prof = true;
+                runner_->prof_enabled = true;
+                runner_->use_cuda_graph = false;
+                strata::ink::g_ink_moe_hook_ctx = runner_.get();
+                strata::ink::g_ink_moe_hook = [](int tag, void* ctx) {
+                    static_cast<strata::ink::InkCudaRunner*>(ctx)->prof_mark_end(8 + tag);
+                };
+                std::fprintf(stderr, "[InkCUDA] STRATA_INK_DEC_PROF=1: eager launches, decode stages per token (1 line/step)\n");
+            }
             try {
                 runner_->init(max_slots_, std::max(256, opts.max_ctx), chunk_try, cuda_kvd, kv_offload_mode);
                 break;
@@ -803,7 +813,9 @@ public:
             auto hnow = [] { return std::chrono::steady_clock::now(); };
             auto hms = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
             auto hq0 = hnow();
+            if (runner_->dec_prof) runner_->prof_mark_start();
             runner_->head_logits_from(h_src, nw);
+            if (runner_->dec_prof) runner_->prof_mark_end(7);
             if (hp) INK_CK(cudaStreamSynchronize(runner_->st));
             auto hq1 = hnow();
             if (cand_out) {
@@ -823,6 +835,7 @@ public:
                     }
                     cand_out->finite[dst] = topk_.h_fin[k] != 0 ? 1 : 0;
                 }
+                if (runner_->dec_prof) runner_->dec_set_head(hms(hq0, hnow()));
                 return;
             }
             // Use pinned host staging buffer for full PCIe 5.0 DMA bandwidth (~50 GB/s vs ~12 GB/s pageable)!
@@ -840,6 +853,7 @@ public:
                     if (s_n % 32 == 0) {
                         std::fprintf(stderr, "[InkCUDA PROF host] %ld logits batches (%.1f rows avg): unembed+softcap %.2f ms, D2H %.2f ms, copy to caller %.2f ms per batch\n",
                                      s_n, (double)s_rows / s_n, s_head / s_n, s_d2h / s_n, s_cpy / s_n);
+                        s_head = s_d2h = s_cpy = 0; s_n = 0; s_rows = 0;   // 窓ごとの平均にする (定常値は後半の行)
                     }
                 }
             } hpg{hp, hms(hq0, hq1), hms(hq1, hq2), hq2, nw};
@@ -853,6 +867,7 @@ public:
                                 h_logits_pin_ + (size_t)k * V, (size_t)V * sizeof(float));
                 }
             }
+            if (runner_->dec_prof) runner_->dec_set_head(hms(hq0, hnow()));
         };
 
         auto copy_host_taps = [&](const std::vector<int>& orig_indices) {

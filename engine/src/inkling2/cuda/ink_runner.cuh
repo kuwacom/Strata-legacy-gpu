@@ -1933,8 +1933,12 @@ struct InkCudaRunner {
     // Optional per-stage profiler (active only when prof_enabled=true and graph disabled)
     bool prof_enabled = false;
     bool prof_prefill = false;   // STRATA_INK_PROF=2: also print the phases of every prefill chunk (M >= 64)
+    bool dec_prof = false;       // STRATA_INK_DEC_PROF=1: decode (M==1) のステージ別 prof。CUDA Graph は使わず eager で event を張る
+    long dec_step = 0;           // dec_prof: forward_seq(M==1) の呼び出し回数。行は次の step の頭で前 step ぶんを出す
+    double dec_h_fwd = 0.0, dec_h_head = 0.0;  // dec_prof: 前 step の host 時間 (forward_seq / unembed+D2H+copy)
     long prof_steps = 0;
-    double prof_ms[16] = {};  // 0=res/ctrl/norm, 1=dense_qkv, 2=sconv_clip_kv, 3=attn, 4=dense_wo, 5=moe, 6=other, 7=unembed
+    double prof_ms[32] = {};  // 0=res/ctrl/norm, 1=dense_qkv, 2=sconv_clip_kv, 3=attn, 4=dense_wo, 5=moe, 6=other, 7=unembed
+                              // dec_prof の追加分: 16=embed, 17=attn(global), 18=attn(SWA), 23=reduce+sconv(層間その他), 24=out_norm
     cudaEvent_t ev_p0 = nullptr, ev_p1 = nullptr;
     // The marks only record events (no sync per phase), so the GPU stays fed and the phase times are the stream's own;
     // prof_flush() adds them up once the step is done.
@@ -1974,7 +1978,7 @@ struct InkCudaRunner {
     }
     void prof_reset() { for (double& x : prof_ms) x = 0.0; }
     void prof_print(const char* tag, int iters) const {
-        double tot = 0; for (double x : prof_ms) tot += x;
+        double tot = 0; for (int i = 0; i < 16; ++i) tot += prof_ms[i];   // dec_prof の追加分 (16..) は含めない
         std::fprintf(stderr, "[PROF %s / %d iters] total=%.2f ms/step | res_ctrl=%.2f dense_qkv=%.2f sconv_kv=%.2f attn=%.2f dense_wo=%.2f moe=%.2f unembed=%.2f\n",
                     tag, iters, tot / iters,
                     prof_ms[0] / iters, prof_ms[1] / iters, prof_ms[2] / iters, prof_ms[3] / iters,
@@ -1983,6 +1987,23 @@ struct InkCudaRunner {
                     iters, prof_ms[8] / iters, prof_ms[9] / iters, prof_ms[10] / iters, prof_ms[11] / iters, prof_ms[12] / iters, prof_ms[13] / iters);
         std::fprintf(stderr, "[PROF moe sk parts / %d iters] gu(sk)=%.2f dn(sk)=%.2f ms/step (each window includes the q8_1 quant of its input)\n",
                     iters, prof_ms[14] / iters, prof_ms[15] / iters);
+    }
+    // dec_prof: 1 step 分のステージを 1 行で出す。emit_selected_logits の unembed event は pairs に残っているのでここで回収する
+    void dec_set_head(double ms) { dec_h_head = ms; }   // dec_prof: backend の emit_selected_logits が host 時間を渡す
+    void dec_report(int step, double host_fwd_ms, double host_head_ms) {
+        if (!dec_prof) return;
+        prof_flush();   // head_argmax の event を回収する (この時点で stream は同期済みなので待ちは無い)
+        double gpu = 0.0;
+        for (double x : prof_ms) gpu += x;
+        std::fprintf(stderr,
+            "[PROF DECODE] step=%d embed=%.3f res_ctrl=%.3f dense_qkv=%.3f sconv_kv=%.3f attn_g=%.3f attn_swa=%.3f dense_wo=%.3f"
+            " router=%.3f bin=%.3f gu_sf4=%.3f dn_sf4=%.3f gu_sk=%.3f dn_sk=%.3f gu_gguf=%.3f dn_gguf=%.3f"
+            " moe_rest=%.3f reduce_sconv=%.3f out_norm=%.3f unembed=%.3f"
+            " | gpu_sum=%.3f host_fwd=%.3f host_head=%.3f wall=%.3f\n",
+            step, prof_ms[16], prof_ms[0], prof_ms[1], prof_ms[2], prof_ms[17], prof_ms[18], prof_ms[4],
+            prof_ms[8], prof_ms[9], prof_ms[10], prof_ms[11], prof_ms[14], prof_ms[15], prof_ms[12], prof_ms[13],
+            prof_ms[5], prof_ms[23], prof_ms[24], prof_ms[7], gpu, host_fwd_ms, host_head_ms, host_fwd_ms + host_head_ms);
+        prof_reset();
     }
 
     // ---- タイル型 prefill attention のステージ別 prof (STRATA_INK_ATTN_PROF=1) ----
@@ -3711,7 +3732,7 @@ struct InkCudaRunner {
                     d_attn_out, M);
             }
         }
-        prof_mark_end(3); prof_mark_start();
+        prof_mark_end(dec_prof && M == 1 ? (is_swa ? 18 : 17) : 3); prof_mark_start();
 
         // 8. Output projection wo + FUSED post-attn ShortConv + residual add / block boundary!
         linear(p + ".attn.wo_ud.weight", d_attn_out, d_wo_raw, M, 0, false, (mode == 2));
@@ -3842,7 +3863,7 @@ struct InkCudaRunner {
                 run_sconv_uniform(d_moe_raw, m.d_sconv_mlp[ip], nullptr, d_cur, kInkHidden, 2 * kInkKVDim + kInkHidden, 0, true);
             }
         }
-        prof_mark_end(2);
+        prof_mark_end(dec_prof && M == 1 ? 23 : 2);
         dbg_hash(visit * 4 + 3, cur_moe_ws->r_logits, M, kInkExperts);
         dbg_hash(visit * 4 + 2, d_cur, M, kInkHidden);
     }
@@ -3852,10 +3873,12 @@ struct InkCudaRunner {
         if (m.ls_active && cur_stage != 0) bind_stage(0);
         const size_t n_hid = (size_t)M * kInkHidden;
         const auto& ei = m.tinfo("model.llm.embed.weight");
+        if (dec_prof && M == 1) prof_mark_start();
         k_ink_embed_norm<<<M, 256, 0, st>>>(
             m.d_trunk + ei.off, ei.fmt,
             (const float*)m.trunk_ptr("model.llm.embed_norm.weight"),
             d_tok_ids, has_img_step ? d_is_img : nullptr, has_img_step ? d_img_emb : nullptr, d_cur, M, kInkHidden);
+        if (dec_prof && M == 1) prof_mark_end(16);
 
         const float* block_ptrs[8] = {};
         int n_blocks = 0;
@@ -3954,8 +3977,10 @@ struct InkCudaRunner {
             for (int b = 0; b < n_blocks; ++b) stp.p[b] = block_ptrs[b];
             stp.p[n_blocks] = d_cur;
             stp.count = n_blocks + 1;
+            if (dec_prof && M == 1) prof_mark_start();
             k_ink_attn_res_mix<<<M, 256, 0, st>>>(stp, (const float*)m.trunk_ptr("model.llm.attn_res.output_query"), d_moe_in, 1, M, kInkHidden);
             k_ink_rms_norm<<<M, 256, 0, st>>>(d_moe_in, (const float*)m.trunk_ptr("model.llm.norm.weight"), d_h_norm, nullptr, M, kInkHidden);
+            if (dec_prof && M == 1) prof_mark_end(24);
             if (want_taps) INK_CK(cudaMemcpyAsync(d_taps[3], d_h_norm, n_hid * 4, cudaMemcpyDeviceToDevice, st));
             dbg_hash(192, d_h_norm, M, kInkHidden);
         }
@@ -3963,6 +3988,12 @@ struct InkCudaRunner {
 
     // ---- Launch Full 48-Visit Forward (with Safe CUDA Graph Capture -> Eager Fallback, NEVER exit(3)!) ----
     void forward_seq(const int32_t* tok_ids, int p0, int M, int slot0, bool want_taps) {
+        if (dec_prof && M == 1 && dec_step > 0) {   // 前 step の unembed event を回収して 1 行出す
+            prof_flush();
+            dec_report(dec_step, dec_h_fwd, dec_h_head);
+            prof_reset();
+        }
+        const double dec_t0 = (dec_prof && M == 1) ? now_s() : 0.0;
         if (m.ls_active && cur_stage != 0) bind_stage(0);
         int32_t* slot_buf = h_meta_pin + (meta_ring_idx++ & 63ull) * meta_ring_stride;
         std::memcpy(slot_buf, tok_ids, (size_t)M * 4);
@@ -3982,6 +4013,9 @@ struct InkCudaRunner {
                     emit_48_visits(M, 0, slot0, p0, want_taps);
                     ge = cudaStreamEndCapture(st, &gr);
                     if (ge == cudaSuccess && gr) {
+                        size_t n_nodes = 0;
+                        cudaGraphGetNodes(gr, nullptr, &n_nodes);
+                        std::fprintf(stderr, "[InkCUDA] CUDA Graph captured: %zu nodes (M=%d)\n", n_nodes, M);
                         ge = cudaGraphInstantiate(&exec, gr, nullptr, nullptr, 0);
                         cudaGraphDestroy(gr);
                     }
@@ -4017,10 +4051,11 @@ struct InkCudaRunner {
                 }
                 prof_reset();
             }
-            else if (++prof_steps % 100 == 0) { prof_print("DECODE-M1", (int)prof_steps); prof_steps = 0; prof_reset(); }
+            else if (!dec_prof && ++prof_steps % 100 == 0) { prof_print("DECODE-M1", (int)prof_steps); prof_steps = 0; prof_reset(); }   // dec_prof は 1 step ずつ main 側で出す
         } else if (attn_prof && M != 1) {
             attn_report(M, p0, -1.0);   // STRATA_INK_PROF 無しでもステージ別だけは取れるようにする
         }
+        if (dec_prof && M == 1) { dec_h_fwd = (now_s() - dec_t0) * 1000.0; ++dec_step; }
     }
 
     // Launch probe for the cold-expert lane (STRATA_INK_EXACT unset): the same short run of decode steps is timed with the CPU lane and with

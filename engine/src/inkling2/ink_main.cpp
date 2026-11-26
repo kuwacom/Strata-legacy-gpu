@@ -225,6 +225,9 @@ static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, in
             ++total_gen;
         }
     } else {
+        const bool dprof = [] { const char* e = std::getenv("STRATA_INK_DEC_PROF"); return e && e[0] == '1'; }();
+        double t_arg = 0.0;
+        long n_arg = 0;
         for (int step = 0; step < gen_len; ++step) {
             batch.clear();
             batch.capture_taps = use_dspark;
@@ -233,6 +236,7 @@ static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, in
                 fprintf(stderr, "bench decode err: %s\n", err.c_str());
                 return 1;
             }
+            const double ta0 = now_s();
             for (int s = 0; s < P; ++s) {
                 const float* lg = logits.data() + static_cast<size_t>(s) * V;
                 int32_t best = 0;
@@ -240,7 +244,15 @@ static int cmd_bench(const std::string& model_path, const BackendOpts& bopts, in
                 next_tok[s] = best;
                 ++total_gen;
             }
+            t_arg += now_s() - ta0;
+            ++n_arg;
+            if (dprof && n_arg % 32 == 0) {
+                printf("[bench] host argmax %.3f ms/token (%ld tokens, P=%d)\n", t_arg * 1000.0 / n_arg, n_arg, P);
+                t_arg = 0.0;
+                n_arg = 0;
+            }
         }
+        if (dprof && n_arg > 0) printf("[bench] host argmax %.3f ms/token (%ld tokens, P=%d)\n", t_arg * 1000.0 / n_arg, n_arg, P);
     }
     double dec_s = now_s() - t_dec0;
     double ppts = (P * prompt_len) / std::max(pf_s, 1e-9);
