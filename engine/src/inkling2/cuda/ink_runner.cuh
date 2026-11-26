@@ -1841,6 +1841,9 @@ struct InkCudaRunner {
     int32_t* d_acc_path = nullptr;
     __nv_bfloat16 *d_x_bf16 = nullptr;
     __nv_bfloat16 *d_w_scratch = nullptr;  // [max_N, max_K] BF16 scratch for Q8_ROW / S_K cuBLAS prefill
+    float* d_head_f32 = nullptr;           // [V, K] FP32 unembed (STRATA_INK_HEAD_F32=1、sm_61 のみ)
+    size_t head_f32_elems = 0;
+    int head_f32_state = 0;                // 0=未試行, 1=常駐, -1=断念して従来経路
     int8_t* d_xq8 = nullptr;               // activations of a Q8_0 dense GEMM, quantized into the mma B-fragment order (k_ink_quant_x_q8f)
     float*  d_xs8 = nullptr;               // and their scales, one per (token, 32-wide block)
 
@@ -2945,6 +2948,56 @@ struct InkCudaRunner {
         }
     }
 
+    // STRATA_INK_HEAD_F32=1: unembed (S_K) の FP32 重みを初回 head 呼び出しで一度だけ作り、常駐させる
+    // 現行経路は毎 token S_K -> BF16 -> FP32 の 2 変換を 66 タイル分行う。ここでは同じ 2 カーネルを
+    // 初回だけ通して同じバイト列の FP32 を作るので、SGEMM への入力は現行と bit 一致する
+    // (タイル幅・lda・ldY・compute type も変えないこと。変えると bit 一致しない)
+    bool ensure_head_f32(const uint8_t* W, int N, int K, int cc, int fmt) {
+        static const bool enabled = [] {
+            const char* e = std::getenv("STRATA_INK_HEAD_F32");
+            return e && std::atoi(e) != 0;
+        }();
+        if (!enabled || head_f32_state < 0) return false;
+        if (head_f32_state == 1) return head_f32_elems == (size_t)N * K;
+        if (cc >= 70) { head_f32_state = -1; return false; }  // sm_70+ は FP16/BF16 Tensor Core 経路を維持する
+        const size_t elems = (size_t)N * K;
+        size_t free_before = 0, vtot = 0;
+        if (ink_cuda_mem_info(&free_before, &vtot) != cudaSuccess) { cudaGetLastError(); return false; }
+        float* p = nullptr;
+        cudaError_t ae = cudaMalloc(&p, elems * sizeof(float));
+        if (ae != cudaSuccess) {
+            cudaGetLastError();
+            std::fprintf(stderr, "[InkCUDA] STRATA_INK_HEAD_F32: unembed FP32 %.1f MiB を確保できず (%s) -> 従来の per-token 変換にフォールバック\n",
+                         (double)elems * 4.0 / (1024.0 * 1024.0), cudaGetErrorString(ae));
+            head_f32_state = -1;
+            return false;
+        }
+        const size_t cap = (size_t)kInkDsparkInter * kInkHidden;
+        const size_t max_tile = (cc < 70) ? (cap / 3) : cap;
+        const int tile_n = std::min(N, (int)(max_tile / (size_t)K));
+        const size_t row_b = (size_t)(K / 256) * ink_sb_bytes(fmt);
+        __nv_bfloat16* w_dst = d_w_scratch + 2 * (cap / 3);
+        for (int n0 = 0; n0 < N; n0 += tile_n) {
+            const int nt = std::min(tile_n, N - n0);
+            dim3 dg((K + 255) / 256, nt);
+            const uint8_t* Wsub = W + (size_t)n0 * row_b;
+            if (fmt == FMT_S5_K)      k_ink_sk_to_bf16<FMT_S5_K><<<dg, 256, 0, st>>>(Wsub, w_dst, nt, K);
+            else if (fmt == FMT_S6_K) k_ink_sk_to_bf16<FMT_S6_K><<<dg, 256, 0, st>>>(Wsub, w_dst, nt, K);
+            else                      k_ink_sk_to_bf16<FMT_S8_K><<<dg, 256, 0, st>>>(Wsub, w_dst, nt, K);
+            const size_t nw = (size_t)nt * K;
+            k_ink_bf16_to_f32<<<(nw + 255) / 256, 256, 0, st>>>(w_dst, p + (size_t)n0 * K, nw);
+        }
+        INK_CK(cudaStreamSynchronize(st));
+        size_t free_after = 0;
+        ink_cuda_mem_info(&free_after, &vtot);
+        std::fprintf(stderr, "[InkCUDA] STRATA_INK_HEAD_F32=1: unembed %dx%d を FP32 で常駐 %.1f MiB (free %zu -> %zu MiB)\n",
+                     N, K, (double)elems * 4.0 / (1024.0 * 1024.0), free_before >> 20, free_after >> 20);
+        d_head_f32 = p;
+        head_f32_elems = elems;
+        head_f32_state = 1;
+        return true;
+    }
+
     // Tracks which converted representation of a shared X buffer is currently valid in d_x_bf16.
     enum XCacheFmt { XC_NONE = 0, XC_BF16 = 1, XC_FP16 = 2, XC_I8 = 3 };
 
@@ -3184,6 +3237,24 @@ struct InkCudaRunner {
                 gemm_bf16_compat(w_dst, X, Y, M, N, K, N, reuse_x_bf16, true);
             }
         } else {
+            if (tname == "model.llm.unembed.weight" && !m.ls_active && ensure_head_f32(W, N, K, cur_cc, ti.fmt)) {
+                // 現行と同じタイル幅で SGEMM だけを回す (タイル境界と ldY=N を変えない)
+                const size_t cap = (size_t)kInkDsparkInter * kInkHidden;
+                const size_t max_tile = (cur_cc < 70) ? (cap / 3) : cap;
+                const int tile_n = std::min(N, (int)(max_tile / (size_t)K));
+                const float alpha = 1.0f, beta = 0.0f;
+                for (int n0 = 0; n0 < N; n0 += tile_n) {
+                    const int nt = std::min(tile_n, N - n0);
+                    INK_CUBLAS_CK(cublasGemmEx(
+                        cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                        nt, M, K, &alpha,
+                        d_head_f32 + (size_t)n0 * K, CUDA_R_32F, K,
+                        X, CUDA_R_32F, K,
+                        &beta, Y + n0, CUDA_R_32F, N,
+                        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+                }
+                return;
+            }
             const size_t cap = (size_t)kInkDsparkInter * kInkHidden;
             const size_t max_tile = (cur_cc < 70) ? (cap / 3) : cap;
             const int tile_n = std::min(N, (int)(max_tile / (size_t)K));
@@ -4222,7 +4293,7 @@ struct InkCudaRunner {
         fr(d_pf_q); fr(d_pf_k); fr(d_pf_v); fr(d_pf_p); fr(d_pf_s); fr(d_pf_o); fr(d_pf_ot); fr(d_pf_m); fr(d_pf_l);
         fr(d_stage_k); fr(d_stage_v); fr(d_stage_sconv);
         fr(d_kv_desc_arr); fr(d_sconv_pool_arr); fr(d_acc_path);
-        fr(d_x_bf16); fr(d_w_scratch); fr(d_logits); fr(d_xq8); fr(d_xs8);
+        fr(d_x_bf16); fr(d_w_scratch); fr(d_head_f32); fr(d_logits); fr(d_xq8); fr(d_xs8);
         fr(d_dot_hat); fr(d_h_norm2); fr(d_max_lb); fr(d_cand_ids); fr(d_cand_cnt); fr(d_argmax);
         fr(d_tok_ids); fr(d_slots); fr(d_pos); fr(d_is_img); fr(d_img_emb); fr(d_sconv_lag); fr(d_tree_anc); fr(d_tree_dep);
         if (h_meta_pin) { cudaFreeHost(h_meta_pin); h_meta_pin = nullptr; }
