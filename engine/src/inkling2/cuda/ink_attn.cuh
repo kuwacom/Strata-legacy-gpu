@@ -600,6 +600,212 @@ __global__ void __launch_bounds__(128) k_ink_flash_gqa_splitk(
     }
 }
 
+// fp16 KV の 4 dim/lane ロードを float4 へ変換する (ink_kv_load4 の kv_fmt==0 と同じ順)
+__device__ __forceinline__ void ink_dec_cvt_kv(uint2 k2, uint2 v2, float4& kv4, float4& vv4) {
+    const float2 kf0 = __half22float2(*reinterpret_cast<const __half2*>(&k2.x));
+    const float2 kf1 = __half22float2(*reinterpret_cast<const __half2*>(&k2.y));
+    const float2 vf0 = __half22float2(*reinterpret_cast<const __half2*>(&v2.x));
+    const float2 vf1 = __half22float2(*reinterpret_cast<const __half2*>(&v2.y));
+    kv4 = make_float4(kf0.x, kf0.y, kf1.x, kf1.y);
+    vv4 = make_float4(vf0.x, vf0.y, vf1.x, vf1.y);
+}
+
+// 従来 attend3 と同じ融合順 (先頭項だけ mul で丸め、残り 3 項を fma) を intrinsic で固定する
+// 式をそのまま渡すと NVCC が別の項を mul に選び、score が 1 ulp ずれる (sm_61 の実測)
+__device__ __forceinline__ float ink_dec_dot4(float4 qv, float4 kv) {
+    return __fmaf_rn(qv.w, kv.w,
+           __fmaf_rn(qv.z, kv.z,
+           __fmaf_rn(qv.y, kv.y, qv.x * kv.x)));
+}
+
+// ---- Decode (M=1) global attention fast path (STRATA_INK_DEC_ATTN=1/2, sm_61) ----
+// 既存の k_ink_flash_gqa_splitk と同じ 32 split / 4 warp / 3 head 共有 / merge 順を保つ。
+//   VAR=1: 古い split (全 key で qp-kp >= 1024) の relpos 参照を除去。rt[1024] は +0.0f なので
+//          CTA 先頭で 1 回だけ読み、従来と同じ加算順 (dot*scale + 0.0f) を保つ
+//   VAR=2: 1 + 次 key の K/V を 1 段先読みしてロードと演算を重ねる
+// K/V は fp16 / host offload なし / global 専用。レイアウトと演算順は従来と同一なので
+// partial m/l/O と merge 出力は bit 一致する
+template <int VAR>
+__global__ void __launch_bounds__(128, 9) k_ink_flash_gqa_splitk_dec(
+    const float* __restrict__ q,          // [1, 24, 128]
+    const float* __restrict__ rel_table,  // [1, 24, 1025]
+    const float* __restrict__ sinks,      // [1, 24]
+    const __half* __restrict__ k_f16,     // [slots, cap, 8, 128]
+    const __half* __restrict__ v_f16,
+    int kv_cap,
+    int slot0,
+    const int32_t* __restrict__ q_pos,    // [1]
+    float* __restrict__ part_m,           // [1, 24, 32]
+    float* __restrict__ part_l,
+    float* __restrict__ part_o) {         // [1, 24, 32, 128]
+    const int kh = blockIdx.x;   // 0..7
+    const int sp = blockIdx.y;   // 0..31
+    const int tid  = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int sl = slot0;
+    const int qp = q_pos[0];
+    const float scale = 0.08838834764831845f;
+
+    const int h0 = 3 * kh;
+    const float4 qv0 = *(const float4*)(q + (size_t)(h0 + 0) * kInkHeadDim + lane * 4);
+    const float4 qv1 = *(const float4*)(q + (size_t)(h0 + 1) * kInkHeadDim + lane * 4);
+    const float4 qv2 = *(const float4*)(q + (size_t)(h0 + 2) * kInkHeadDim + lane * 4);
+    const float* rt0 = rel_table + (size_t)(h0 + 0) * (kInkRelExtent + 1);
+    // 古い split は dist = 1024 固定。rt[1024] = +0.0f を CTA で 1 回だけ読む
+    const float rz0 = rt0[kInkRelExtent];
+    const float rz1 = rt0[(kInkRelExtent + 1) + kInkRelExtent];
+    const float rz2 = rt0[2 * (kInkRelExtent + 1) + kInkRelExtent];
+
+    const int k_len  = qp + 1;
+    const int per_sp = (k_len + kInkAttnMaxSplits - 1) / kInkAttnMaxSplits;
+    const int s_beg  = sp * per_sp;
+    const int s_end  = min(min(k_len, s_beg + per_sp), kv_cap);
+    // 全 key で qp-kp >= 1024 なら relpos は 0。空 split でも結果は同じ
+    const bool old = (qp - (s_end - 1) >= kInkRelExtent);
+
+    // split 0 / warp 0 が sink を畳み込む (従来と同一)
+    float mw[3] = {
+        (sp == 0 && warp == 0) ? sinks[h0 + 0] : -1e30f,
+        (sp == 0 && warp == 0) ? sinks[h0 + 1] : -1e30f,
+        (sp == 0 && warp == 0) ? sinks[h0 + 2] : -1e30f
+    };
+    float lw[3] = {
+        (sp == 0 && warp == 0) ? 1.0f : 0.0f,
+        (sp == 0 && warp == 0) ? 1.0f : 0.0f,
+        (sp == 0 && warp == 0) ? 1.0f : 0.0f
+    };
+    float a[3][4] = {};
+
+    auto attend_old = [&](float4 kv4, float4 vv4) {
+        float d0 = __fmaf_rn(warp_sum(ink_dec_dot4(qv0, kv4)), scale, rz0);
+        float d1 = __fmaf_rn(warp_sum(ink_dec_dot4(qv1, kv4)), scale, rz1);
+        float d2 = __fmaf_rn(warp_sum(ink_dec_dot4(qv2, kv4)), scale, rz2);
+        const float sc[3] = {d0, d1, d2};
+#pragma unroll
+        for (int r = 0; r < 3; ++r) {
+            const float mn = fmaxf(mw[r], sc[r]);
+            const float al = __expf(mw[r] - mn);
+            const float p  = __expf(sc[r] - mn);
+            lw[r] = lw[r] * al + p;
+            a[r][0] = a[r][0] * al + p * vv4.x;
+            a[r][1] = a[r][1] * al + p * vv4.y;
+            a[r][2] = a[r][2] * al + p * vv4.z;
+            a[r][3] = a[r][3] * al + p * vv4.w;
+            mw[r] = mn;
+        }
+    };
+    auto attend_new = [&](float4 kv4, float4 vv4, int kp) {
+        const int dist = min(max(qp - kp, 0), kInkRelExtent);
+        float d0 = __fmaf_rn(warp_sum(ink_dec_dot4(qv0, kv4)), scale, rt0[dist]);
+        float d1 = __fmaf_rn(warp_sum(ink_dec_dot4(qv1, kv4)), scale, rt0[(kInkRelExtent + 1) + dist]);
+        float d2 = __fmaf_rn(warp_sum(ink_dec_dot4(qv2, kv4)), scale, rt0[2 * (kInkRelExtent + 1) + dist]);
+        const float sc[3] = {d0, d1, d2};
+#pragma unroll
+        for (int r = 0; r < 3; ++r) {
+            const float mn = fmaxf(mw[r], sc[r]);
+            const float al = __expf(mw[r] - mn);
+            const float p  = __expf(sc[r] - mn);
+            lw[r] = lw[r] * al + p;
+            a[r][0] = a[r][0] * al + p * vv4.x;
+            a[r][1] = a[r][1] * al + p * vv4.y;
+            a[r][2] = a[r][2] * al + p * vv4.z;
+            a[r][3] = a[r][3] * al + p * vv4.w;
+            mw[r] = mn;
+        }
+    };
+
+    // ink_kv_load4 の kv_fmt==0 / host_cap==0 と同じバイト列 (uint2 x2 -> float4)
+    auto load_kv = [&](const __half* pk, const __half* pv, float4& kv4, float4& vv4) {
+        ink_dec_cvt_kv(*(const uint2*)pk, *(const uint2*)pv, kv4, vv4);
+    };
+
+    const int kp0 = s_beg + warp;
+    const size_t base = ((size_t)sl * kv_cap + kp0) * kInkKVDim + (size_t)kh * kInkHeadDim + lane * 4;
+    const __half* pk = k_f16 + base;
+    const __half* pv = v_f16 + base;
+    if (kp0 < s_end) {
+        if (old) {
+            if (VAR == 2) {
+                uint2 k2 = *(const uint2*)pk;
+                uint2 v2 = *(const uint2*)pv;
+                int kp = kp0;
+                while (kp + 4 < s_end) {
+                    // 次 key を先に発行し、現在 key の演算と重ねる
+                    const uint2 k2n = *(const uint2*)(pk + 4 * kInkKVDim);
+                    const uint2 v2n = *(const uint2*)(pv + 4 * kInkKVDim);
+                    float4 kv4, vv4;
+                    ink_dec_cvt_kv(k2, v2, kv4, vv4);
+                    attend_old(kv4, vv4);
+                    k2 = k2n; v2 = v2n;
+                    pk += 4 * kInkKVDim; pv += 4 * kInkKVDim; kp += 4;
+                }
+                float4 kv4, vv4;
+                ink_dec_cvt_kv(k2, v2, kv4, vv4);
+                attend_old(kv4, vv4);
+            } else {
+                for (int kp = kp0; kp < s_end; kp += 4) {
+                    float4 kv4, vv4;
+                    load_kv(pk, pv, kv4, vv4);
+                    attend_old(kv4, vv4);
+                    pk += 4 * kInkKVDim; pv += 4 * kInkKVDim;
+                }
+            }
+        } else {
+            if (VAR == 2) {
+                uint2 k2 = *(const uint2*)pk;
+                uint2 v2 = *(const uint2*)pv;
+                int kp = kp0;
+                while (kp + 4 < s_end) {
+                    const uint2 k2n = *(const uint2*)(pk + 4 * kInkKVDim);
+                    const uint2 v2n = *(const uint2*)(pv + 4 * kInkKVDim);
+                    float4 kv4, vv4;
+                    ink_dec_cvt_kv(k2, v2, kv4, vv4);
+                    attend_new(kv4, vv4, kp);
+                    k2 = k2n; v2 = v2n;
+                    pk += 4 * kInkKVDim; pv += 4 * kInkKVDim; kp += 4;
+                }
+                float4 kv4, vv4;
+                ink_dec_cvt_kv(k2, v2, kv4, vv4);
+                attend_new(kv4, vv4, kp);
+            } else {
+                for (int kp = kp0; kp < s_end; kp += 4) {
+                    float4 kv4, vv4;
+                    load_kv(pk, pv, kv4, vv4);
+                    attend_new(kv4, vv4, kp);
+                    pk += 4 * kInkKVDim; pv += 4 * kInkKVDim;
+                }
+            }
+        }
+    }
+
+    // 4 warp の online-softmax を merge して partial を書く (従来と同一順)
+    __shared__ float sm_m[4], sm_l[4], sm_a[4][kInkHeadDim];
+#pragma unroll
+    for (int r = 0; r < 3; ++r) {
+        if (lane == 0) { sm_m[warp] = mw[r]; sm_l[warp] = lw[r]; }
+        sm_a[warp][lane * 4 + 0] = a[r][0]; sm_a[warp][lane * 4 + 1] = a[r][1];
+        sm_a[warp][lane * 4 + 2] = a[r][2]; sm_a[warp][lane * 4 + 3] = a[r][3];
+        __syncthreads();
+        if (warp == 0) {
+            float mg = fmaxf(fmaxf(sm_m[0], sm_m[1]), fmaxf(sm_m[2], sm_m[3]));
+            float w0 = sm_l[0] > 0.0f ? __expf(sm_m[0] - mg) : 0.0f;
+            float w1 = sm_l[1] > 0.0f ? __expf(sm_m[1] - mg) : 0.0f;
+            float w2 = sm_l[2] > 0.0f ? __expf(sm_m[2] - mg) : 0.0f;
+            float w3 = sm_l[3] > 0.0f ? __expf(sm_m[3] - mg) : 0.0f;
+            const float lt = sm_l[0] * w0 + sm_l[1] * w1 + sm_l[2] * w2 + sm_l[3] * w3;
+            const size_t idx_sp = ((size_t)(h0 + r)) * kInkAttnMaxSplits + sp;
+            if (lane == 0) { part_m[idx_sp] = mg; part_l[idx_sp] = lt; }
+            *(float4*)(part_o + idx_sp * kInkHeadDim + lane * 4) = make_float4(
+                sm_a[0][lane * 4 + 0] * w0 + sm_a[1][lane * 4 + 0] * w1 + sm_a[2][lane * 4 + 0] * w2 + sm_a[3][lane * 4 + 0] * w3,
+                sm_a[0][lane * 4 + 1] * w0 + sm_a[1][lane * 4 + 1] * w1 + sm_a[2][lane * 4 + 1] * w2 + sm_a[3][lane * 4 + 1] * w3,
+                sm_a[0][lane * 4 + 2] * w0 + sm_a[1][lane * 4 + 2] * w1 + sm_a[2][lane * 4 + 2] * w2 + sm_a[3][lane * 4 + 2] * w3,
+                sm_a[0][lane * 4 + 3] * w0 + sm_a[1][lane * 4 + 3] * w1 + sm_a[2][lane * 4 + 3] * w2 + sm_a[3][lane * 4 + 3] * w3);
+        }
+        __syncthreads();
+    }
+}
+
 // Merge n_splits (8..32) + fused * sigmoid(gate_attn)! Grid: (24 heads, M), Block: 128 (1 dim/thread!)
 __global__ void __launch_bounds__(128) k_ink_flash_gqa_merge(
     const float* __restrict__ part_m,     // [M, 24, n_splits]

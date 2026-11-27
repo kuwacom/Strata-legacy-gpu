@@ -1846,6 +1846,7 @@ struct InkCudaRunner {
     int head_f32_state = 0;                // 0=未試行, 1=常駐, -1=断念して従来経路
     // 既定判定用: 呼び出し側が full logits 経路 (--draft off) のとき true にする。dspark (screen 経路) では false
     bool head_f32_full_logits = false;
+    int dec_attn_variant = 0;              // STRATA_INK_DEC_ATTN: 0=従来, 1=global relpos skip, 2=1+KV prefetch (M=1 のみ)
     int8_t* d_xq8 = nullptr;               // activations of a Q8_0 dense GEMM, quantized into the mma B-fragment order (k_ink_quant_x_q8f)
     float*  d_xs8 = nullptr;               // and their scales, one per (token, 32-wide block)
 
@@ -2239,6 +2240,12 @@ struct InkCudaRunner {
         }
         // 安全弁: STRATA_INK_PF_TILE=0 でタイル型 prefill attention を止め、従来の per-token 経路 (k_ink_flash_gqa_gqa3) に戻す
         if (const char* pt = std::getenv("STRATA_INK_PF_TILE"); pt && pt[0] == '0') pf_tile_enabled = false;
+        // STRATA_INK_DEC_ATTN=1/2: decode M=1 global attention の fast path (既定 0 = 従来カーネル)
+        if (const char* da = std::getenv("STRATA_INK_DEC_ATTN")) {
+            const int v = std::atoi(da);
+            if (v >= 0 && v <= 2) dec_attn_variant = v;
+            std::fprintf(stderr, "[InkCUDA] DEC_ATTN variant = %d\n", dec_attn_variant);
+        }
         // 計測専用: STRATA_INK_ATTN_PROF=1 でタイル型 prefill attention のステージ別 event を取る (既定 off = ゼロオーバーヘッド)
         if (const char* ap = std::getenv("STRATA_INK_ATTN_PROF"); ap && ap[0] == '1') attn_prof = true;
         // PV SGEMM の形状 (既定 2 = KV head 8 本を n=3C で束ねる。0 で従来の m=head_dim/n=C/batch=24 に戻る)
@@ -3568,12 +3575,26 @@ struct InkCudaRunner {
                 // warp walk and the merge are the same; only the count differed: 8 for M > 1 against 16 / 32 for M == 1)
                 const int n_sp = (M == 1 || mode == 2) ? (is_swa ? 16 : kInkAttnMaxSplits) : kInkAttnSplits;
                 dim3 gsp(kInkKVHeads, n_sp, M);
-                k_ink_flash_gqa_splitk<<<gsp, 128, 0, st>>>(
-                    d_q, d_rel_table, d_sinks,
-                    kv_desc[visit], (mode == 1) ? d_slots : nullptr, slot0, d_pos,
-                    (mode == 2) ? d_k : nullptr, (mode == 2) ? d_v : nullptr,
-                    (mode == 2) ? d_tree_anc : nullptr, (mode == 2) ? d_tree_dep : nullptr,
-                    p0_val, d_attn_pm, d_attn_pl, d_attn_po, M, n_sp);
+                const InkKvVisitDesc& kvd = kv_desc[visit];
+                // decode M=1 global の fp16 / host offload なしだけ fast path を使う (split 数・warp 割当・merge 順は不変)
+                const bool dec_fast = (dec_attn_variant != 0 && mode == 0 && M == 1 && !is_swa &&
+                                       kvd.kv_fmt == 0 && kvd.host_cap == 0);
+                if (dec_fast && dec_attn_variant == 2) {
+                    k_ink_flash_gqa_splitk_dec<2><<<gsp, 128, 0, st>>>(
+                        d_q, d_rel_table, d_sinks, kvd.k_f16, kvd.v_f16, kvd.cap_pos, slot0, d_pos,
+                        d_attn_pm, d_attn_pl, d_attn_po);
+                } else if (dec_fast) {
+                    k_ink_flash_gqa_splitk_dec<1><<<gsp, 128, 0, st>>>(
+                        d_q, d_rel_table, d_sinks, kvd.k_f16, kvd.v_f16, kvd.cap_pos, slot0, d_pos,
+                        d_attn_pm, d_attn_pl, d_attn_po);
+                } else {
+                    k_ink_flash_gqa_splitk<<<gsp, 128, 0, st>>>(
+                        d_q, d_rel_table, d_sinks,
+                        kv_desc[visit], (mode == 1) ? d_slots : nullptr, slot0, d_pos,
+                        (mode == 2) ? d_k : nullptr, (mode == 2) ? d_v : nullptr,
+                        (mode == 2) ? d_tree_anc : nullptr, (mode == 2) ? d_tree_dep : nullptr,
+                        p0_val, d_attn_pm, d_attn_pl, d_attn_po, M, n_sp);
+                }
                 k_ink_flash_gqa_merge<<<gr, 128, 0, st>>>(d_attn_pm, d_attn_pl, d_attn_po, d_gate_attn, d_attn_out, M, n_sp);
             } else if (mode == 0 && M >= 128 && (cur_cc >= 70 || cur_cc == 60 || cur_cc == 61) && pf_tile_enabled && ensure_pf_attn(kInkPfKvTile, pf_elem_for_cc(cur_cc))) {
                 // O(1)-VRAM KV-Tiled Online-Softmax Tensor Core Prefill Attention (fixed <= ~114 MiB even at 256K+ ctx!)
