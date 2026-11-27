@@ -1831,7 +1831,7 @@ struct InkCudaRunner {
     // 読み書きする側はこの要素サイズでアドレスを進める
     int pf_elem_cap = 0;          // d_pf_q/k/v/p の 1 要素のバイト数 (2 = BF16/FP16, 4 = FP32)
     bool pf_tile_enabled = true;  // STRATA_INK_PF_TILE=0: タイル型 prefill attention を止めて per-token 経路に戻す
-    bool dec_rc = false;          // STRATA_INK_DEC_RC=1: M=1 decode の depth mix を共有する (既定 0 = 従来経路)
+    bool dec_rc = false;          // STRATA_INK_DEC_RC: M=1 decode の depth mix を共有する (未指定は 1、env=0 で従来経路)
     int pf_pv_shape = 2;          // STRATA_INK_PV_SHAPE: 0 = 従来 (m=128/n=C/batch=24)、2 = KV head 8 本を n=3C で束ねる (既定)
     int pf_gqa_pack = 1;          // STRATA_INK_GQA_PACK=0: pack_kv の GQA 3 複製を残し、QK/PV を batch=24 で回す (従来経路)
     int pf_gqa_cap = -1;          // 作業領域を確保したときの pf_gqa_pack
@@ -1847,7 +1847,7 @@ struct InkCudaRunner {
     int head_f32_state = 0;                // 0=未試行, 1=常駐, -1=断念して従来経路
     // 既定判定用: 呼び出し側が full logits 経路 (--draft off) のとき true にする。dspark (screen 経路) では false
     bool head_f32_full_logits = false;
-    int dec_attn_variant = 0;              // STRATA_INK_DEC_ATTN: 0=従来, 1=global relpos skip, 2=1+KV prefetch (M=1 のみ)
+    int dec_attn_variant = 0;              // STRATA_INK_DEC_ATTN: 0=従来, 1=global relpos skip, 2=1+KV prefetch (M=1 のみ。未指定は sm_61 で 2)
     int8_t* d_xq8 = nullptr;               // activations of a Q8_0 dense GEMM, quantized into the mma B-fragment order (k_ink_quant_x_q8f)
     float*  d_xs8 = nullptr;               // and their scales, one per (token, 32-wide block)
 
@@ -2241,16 +2241,28 @@ struct InkCudaRunner {
         }
         // 安全弁: STRATA_INK_PF_TILE=0 でタイル型 prefill attention を止め、従来の per-token 経路 (k_ink_flash_gqa_gqa3) に戻す
         if (const char* pt = std::getenv("STRATA_INK_PF_TILE"); pt && pt[0] == '0') pf_tile_enabled = false;
-        // STRATA_INK_DEC_ATTN=1/2: decode M=1 global attention の fast path (既定 0 = 従来カーネル)
-        if (const char* da = std::getenv("STRATA_INK_DEC_ATTN")) {
-            const int v = std::atoi(da);
-            if (v >= 0 && v <= 2) dec_attn_variant = v;
-            std::fprintf(stderr, "[InkCUDA] DEC_ATTN variant = %d\n", dec_attn_variant);
+        // STRATA_INK_DEC_ATTN=1/2: decode M=1 global attention の fast path (env=0 で従来カーネル)
+        // 未指定は sm_61 で variant 2 を既定にする。実際に fast path を使うのは M=1 / global / fp16 KV の
+        // ときだけで、それ以外 (SWA, M>1, k8v4, host offload) は従来カーネルのまま
+        {
+            const char* da = std::getenv("STRATA_INK_DEC_ATTN");
+            if (da) {
+                const int v = std::atoi(da);
+                if (v >= 0 && v <= 2) dec_attn_variant = v;
+            } else if (m.sm_cc == 61) {
+                dec_attn_variant = 2;
+            }
+            std::fprintf(stderr, "[InkCUDA] DEC_ATTN variant = %d (%s)\n", dec_attn_variant,
+                         dec_attn_variant ? "fast path: M=1 global fp16 KV" : "従来カーネル");
         }
         // 最適化: STRATA_INK_DEC_RC=1 で M=1 decode の depth mix (msg/src) を別 CTA に分け、SWA の src を共有する
-        if (const char* rc = std::getenv("STRATA_INK_DEC_RC"); rc && rc[0] == '1') {
-            dec_rc = true;
-            std::fprintf(stderr, "[InkCUDA] STRATA_INK_DEC_RC=1: decode の depth mix を共有\n");
+        // 未指定は 1 を既定にする。実際に共有するのは M=1 decode のときだけなので、それ以外は従来経路のまま
+        // env に 0 を指定すれば従来経路に戻る
+        {
+            const char* rc = std::getenv("STRATA_INK_DEC_RC");
+            if (!(rc && std::atoi(rc) == 0)) dec_rc = true;
+            std::fprintf(stderr, "[InkCUDA] STRATA_INK_DEC_RC=%d (%s)\n", dec_rc ? 1 : 0,
+                         dec_rc ? "M=1 decode の depth mix を共有" : "従来経路");
         }
         // 計測専用: STRATA_INK_ATTN_PROF=1 でタイル型 prefill attention のステージ別 event を取る (既定 off = ゼロオーバーヘッド)
         if (const char* ap = std::getenv("STRATA_INK_ATTN_PROF"); ap && ap[0] == '1') attn_prof = true;
