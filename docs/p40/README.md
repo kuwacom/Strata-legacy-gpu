@@ -195,6 +195,19 @@ Tesla P40 1 枚 (24 GB, sm_61) で Inkling-2-Mini SQ-10 を動かし、prefill �
 - 512K の最新は draft off で 4,593 s、decode 7.7 tok/s、host スピルなし、VRAM ピーク 17.5 GB (17,499 MiB)
 - 起点は upstream 0.2.21 の移植直後 (32K と 128K は素の fork、512K は同じ k8v4 構成)
 
+### decode の到達点
+
+| 文脈 | 起点 (tok/s) | 最終 (tok/s) | 差 |
+|---|---:|---:|---:|
+| 8K | 20.3 | 33.0 | +62.6% |
+| 32K | 18.0 | 27.0 | +50.0% |
+| 128K | 13.8 | 21.6 | +56.5% |
+| 256K | 10.4 | 16.3 | +56.7% |
+
+- 起点は移植直後の draft off。8K/32K は unembed の FP32 常駐、128K/256K はそれに global attention の 1 ウェーブ化と res_ctrl 共有が乗る
+- 256K の VRAM ピークは 21,223 MiB / 24,576 MiB で host スピルなし。needle 32K は 7741
+- 8K/128K/256K は同一セッションで連続測定 (env は `STRATA_INK_PF_TILE=1 STRATA_INK_PROF=2` のみ)。32K は dspark (gen 64) の 1 本
+
 ### 施策
 
 - タイル型 FP32 prefill attention (sm_61)。`STRATA_INK_PF_TILE=1`
@@ -206,6 +219,10 @@ Tesla P40 1 枚 (24 GB, sm_61) で Inkling-2-Mini SQ-10 を動かし、prefill �
 - MoE MMQ の復活 (`-DSTRATA_MMQ=ON`、opt-in)。移植 5 段には QSA value 8 CTA/SM と
   hyper-connection の BF16 down/inject も含む
 - 計測用: `STRATA_INK_PROF`、`STRATA_INK_ATTN_PROF`、`STRATA_PREFILL_TIMING`
+- unembed の FP32 常駐。既定 `STRATA_INK_HEAD_F32=1` (sm_61 単機 + full logits 経路、bit 一致)
+- decode global attention の 1 ウェーブ化。既定 `STRATA_INK_DEC_ATTN=2` (sm_61、M=1 / global / fp16 KV、bit 一致)
+- res_ctrl の depth mix 共有。既定 `STRATA_INK_DEC_RC=1` (M=1 decode、bit 一致)
+- decode の区間別 prof。`STRATA_INK_DEC_PROF=1` (既定 off、ゼロオーバーヘッド)
 
 ### ブランチの積み順
 
@@ -220,6 +237,16 @@ Tesla P40 1 枚 (24 GB, sm_61) で Inkling-2-Mini SQ-10 を動かし、prefill �
 この 3 つを `inkling` に取り込むと 15 コミット。`perf/ink-final` とのツリー差は
 移植分と MMQ 分だけ。`perf/ink-dn-shared` と `perf/ink-final2` を足すと 17 コミットになり、
 `perf/ink-final2` とのツリー差は移植分と MMQ 分と docs だけになる。
+
+decode の最適化はその上に次の順で積む。
+
+6. `perf/ink-head-f32` (1 コミット) -> `perf/ink-head-default` (1 コミット)
+7. `perf/ink-decode-prof` (1 コミット)
+8. `perf/ink-dec-attn` (decode prof を除く 1 コミット。decode prof が先に入っていることが前提)
+9. `perf/ink-dec-rc` (decode prof を除く 1 コミット)
+
+decode prof は `perf/ink-decode-prof` / `perf/ink-dec-attn` / `perf/ink-dec-rc` に同一パッチとして
+存在するので 1 回だけ入れる。この 5 コミットと既定の整理 1 コミットを足すと 23 コミットになる。
 
 ### 文書一覧
 
@@ -243,6 +270,7 @@ Tesla P40 1 枚 (24 GB, sm_61) で Inkling-2-Mini SQ-10 を動かし、prefill �
 - `sf4-launch.md` - SF4 MoE の起動削減
 - `moe-prof.md` - MoE S_K 区間の prof
 - `occ-final.md` - occupancy 版の最終確認
+- `decode-optimization.md` - decode の区間別内訳と 4 施策 (unembed 常駐 / global attention / res_ctrl 共有 / prof) の統合結果
 
 ランタイムと測定:
 
