@@ -662,6 +662,130 @@ __global__ void __launch_bounds__(256) k_ink_attn_res_3x_cat_rms(
     }
 }
 
+
+// STRATA_INK_DEC_RC=1 (M=1 decode の has_msg visit) 用: 同じ depth mix の重複計算を共有する
+//  - msg (bank) と src (depth) を別 CTA に分ける。従来は 1 CTA が msg+src を直列に計算していた
+//  - is_swa では src が attn/k/v の 3 controller で同一 (rq=0) なので 1 CTA だけが計算し、
+//    cat3 の src 半分を 3 slot に書く。msg と controller の重みは controller ごとに違うので共有しない
+//  - 状態行は shared に 1 回だけ読み、ss/dot と重み付き和の 2 回読みをなくす
+//    (値は同一バイト列なので演算順・丸めは変わらず bit 一致)
+// Grid: dim3(M, 7), Block: 256 threads。y=0..3 = msg_c、y=4..6 = src_c (is_swa は y=4 のみ)
+// MAX_S は状態数の上限。超えるときは呼び出し側が従来カーネルにフォールバックする
+template <int MAX_S>
+__global__ void __launch_bounds__(256) k_ink_attn_res_rc_cat_rms(
+    DepthStatePtrs stp,              // depth states [0..S-1]
+    const float* __restrict__ q_res, // [1 or 3, D]
+    bool is_swa,
+    DepthStatePtrs bst,              // bank states [0..B-1]
+    const float* __restrict__ q_msg, // [4, D]
+    float* __restrict__ mixed_out,   // [3, M, D] (is_swa は slot 0 のみ)
+    float* __restrict__ msgs_out,    // [4, M, D]
+    float* __restrict__ cat3_out,    // [3, M, 2*D]
+    int M, int D) {
+    const int m = blockIdx.x;
+    const int c = blockIdx.y;  // 0..6
+    if (m >= M || c >= 7) return;
+    const bool is_msg = (c < 4);
+    if (!is_msg && is_swa && c > 4) return;  // SWA の src は 1 CTA で足りる
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int D4 = D >> 2;
+    const float inv_sqrt_d = rsqrtf((float)D);
+    // float4 で読み書きするので 16 B 境界に置く
+    __shared__ __align__(16) float s_row[MAX_S][kInkHidden];
+    __shared__ float s_wred[8][2][8];
+    __shared__ float s_prob[8];
+    __shared__ float s_sc[8];
+    __shared__ float s_sinv[8];
+    __shared__ float sh[32];
+
+    const DepthStatePtrs& ds = is_msg ? bst : stp;
+    const int S = ds.count;
+    const float* q = is_msg ? (q_msg + (size_t)c * D)
+                            : (q_res + (size_t)(is_swa ? 0 : (c - 4)) * D);
+    const float4* q4 = reinterpret_cast<const float4*>(q);
+
+    // 1. 状態行を shared へ置きながら ss/dot を取る。softmax は従来と同じ順で計算する
+    for (int s = 0; s < S; ++s) {
+        const float4* sp4 = reinterpret_cast<const float4*>(ds.p[s] + (size_t)m * D);
+        float4* sr4 = reinterpret_cast<float4*>(s_row[s]);
+        float ss = 0.0f, dot = 0.0f;
+        for (int i = tid; i < D4; i += 256) {
+            const float4 sv = sp4[i], qv = q4[i];
+            sr4[i] = sv;
+            ss  += sv.x * sv.x + sv.y * sv.y + sv.z * sv.z + sv.w * sv.w;
+            dot = fmaf(sv.x, qv.x, dot); dot = fmaf(sv.y, qv.y, dot);
+            dot = fmaf(sv.z, qv.z, dot); dot = fmaf(sv.w, qv.w, dot);
+        }
+        ss  = warp_sum(ss);
+        dot = warp_sum(dot);
+        if (lane == 0) { s_wred[s][0][warp] = ss; s_wred[s][1][warp] = dot; }
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float mx = -1e30f;
+        for (int s = 0; s < S; ++s) {
+            float ss = 0.0f, ds_v = 0.0f;
+#pragma unroll
+            for (int w = 0; w < 8; ++w) { ss += s_wred[s][0][w]; ds_v += s_wred[s][1][w]; }
+            s_sinv[s] = rsqrtf(ss / (float)D + kInkRmsEps);
+            s_sc[s] = ds_v * s_sinv[s] * inv_sqrt_d;
+            mx = fmaxf(mx, s_sc[s]);
+        }
+        float sum = 0.0f;
+        for (int s = 0; s < S; ++s) { s_sc[s] = expf(s_sc[s] - mx); sum += s_sc[s]; }
+        const float inv_s = 1.0f / sum;
+        for (int s = 0; s < S; ++s) s_prob[s] = s_sc[s] * inv_s * s_sinv[s];
+    }
+    __syncthreads();
+
+    // 2. shared の行から重み付き和を作る (従来と同じ fmaf 順)
+    float4* dst4 = is_msg
+        ? reinterpret_cast<float4*>(msgs_out + ((size_t)c * M + m) * D)
+        : reinterpret_cast<float4*>(mixed_out + (size_t)(is_swa ? 0 : (c - 4)) * M * D + (size_t)m * D);
+    float ssum = 0.0f;
+    for (int i = tid; i < D4; i += 256) {
+        float ax = 0.0f, ay = 0.0f, az = 0.0f, aw = 0.0f;
+        for (int s = 0; s < S; ++s) {
+            const float w = s_prob[s];
+            const float4 sv = reinterpret_cast<const float4*>(s_row[s])[i];
+            ax = fmaf(w, sv.x, ax); ay = fmaf(w, sv.y, ay);
+            az = fmaf(w, sv.z, az); aw = fmaf(w, sv.w, aw);
+        }
+        dst4[i] = make_float4(ax, ay, az, aw);
+        ssum += ax * ax + ay * ay + az * az + aw * aw;
+    }
+    if (cat3_out == nullptr) return;
+    ssum = block_sum(ssum, sh);
+    const float inv = rsqrtf(ssum / (float)D + kInkRmsEps);
+
+    if (is_msg) {
+        // c==3 は MLP 用 msg だけ (従来カーネルも cat3 を書かない)。d_ctrl_cat は 3 slot なので書くと溢れる
+        if (c >= 3) return;
+        float4* d1 = reinterpret_cast<float4*>(cat3_out + ((size_t)c * M + m) * (2 * D) + D);
+        for (int i = tid; i < D4; i += 256) {
+            const float4 mv = dst4[i];
+            d1[i] = make_float4(mv.x * inv, mv.y * inv, mv.z * inv, mv.w * inv);
+        }
+    } else if (is_swa) {
+        // src は attn/k/v で同一。3 slot の前半へ同じバイト列を書く
+        for (int cc = 0; cc < 3; ++cc) {
+            float4* d0 = reinterpret_cast<float4*>(cat3_out + ((size_t)cc * M + m) * (2 * D));
+            for (int i = tid; i < D4; i += 256) {
+                const float4 sv = dst4[i];
+                d0[i] = make_float4(sv.x * inv, sv.y * inv, sv.z * inv, sv.w * inv);
+            }
+        }
+    } else {
+        float4* d0 = reinterpret_cast<float4*>(cat3_out + ((size_t)(c - 4) * M + m) * (2 * D));
+        for (int i = tid; i < D4; i += 256) {
+            const float4 sv = dst4[i];
+            d0[i] = make_float4(sv.x * inv, sv.y * inv, sv.z * inv, sv.w * inv);
+        }
+    }
+}
+
 // FUSED 1-Launch Looped Pre-MLP Kernel: replaces attn_res_mix(d_moe_in) + ctrl_cat_rms (-24 launches/step!)
 __global__ void __launch_bounds__(256) k_ink_mlp_res_cat_rms(
     DepthStatePtrs stp,

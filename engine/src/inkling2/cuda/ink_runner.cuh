@@ -1831,6 +1831,7 @@ struct InkCudaRunner {
     // 読み書きする側はこの要素サイズでアドレスを進める
     int pf_elem_cap = 0;          // d_pf_q/k/v/p の 1 要素のバイト数 (2 = BF16/FP16, 4 = FP32)
     bool pf_tile_enabled = true;  // STRATA_INK_PF_TILE=0: タイル型 prefill attention を止めて per-token 経路に戻す
+    bool dec_rc = false;          // STRATA_INK_DEC_RC=1: M=1 decode の depth mix を共有する (既定 0 = 従来経路)
     int pf_pv_shape = 2;          // STRATA_INK_PV_SHAPE: 0 = 従来 (m=128/n=C/batch=24)、2 = KV head 8 本を n=3C で束ねる (既定)
     int pf_gqa_pack = 1;          // STRATA_INK_GQA_PACK=0: pack_kv の GQA 3 複製を残し、QK/PV を batch=24 で回す (従来経路)
     int pf_gqa_cap = -1;          // 作業領域を確保したときの pf_gqa_pack
@@ -2245,6 +2246,11 @@ struct InkCudaRunner {
             const int v = std::atoi(da);
             if (v >= 0 && v <= 2) dec_attn_variant = v;
             std::fprintf(stderr, "[InkCUDA] DEC_ATTN variant = %d\n", dec_attn_variant);
+        }
+        // 最適化: STRATA_INK_DEC_RC=1 で M=1 decode の depth mix (msg/src) を別 CTA に分け、SWA の src を共有する
+        if (const char* rc = std::getenv("STRATA_INK_DEC_RC"); rc && rc[0] == '1') {
+            dec_rc = true;
+            std::fprintf(stderr, "[InkCUDA] STRATA_INK_DEC_RC=1: decode の depth mix を共有\n");
         }
         // 計測専用: STRATA_INK_ATTN_PROF=1 でタイル型 prefill attention のステージ別 event を取る (既定 off = ゼロオーバーヘッド)
         if (const char* ap = std::getenv("STRATA_INK_ATTN_PROF"); ap && ap[0] == '1') attn_prof = true;
@@ -3421,12 +3427,24 @@ struct InkCudaRunner {
                 in_k = is_swa ? d_mixed : (d_mixed + 1 * n_hid);
                 in_v = is_swa ? d_mixed : (d_mixed + 2 * n_hid);
             } else {
-                k_ink_attn_res_3x_cat_rms<<<dim3(M, 4), 256, 0, st>>>(
-                    stp, q_res, is_swa, *bank_stp, m.d_msg_queries[ip - m.man.c.core_start],
-                    d_mixed, d_msgs, (M <= 16) ? d_ctrl_cat : nullptr, M, kInkHidden);
+                // STRATA_INK_DEC_RC=1: M=1 decode は msg と src を別 CTA に分ける。SWA は src が 3 controller で
+                // 同一 (rq=0) なので 1 CTA だけが作り、cat3 の src 半分を 3 slot に書く (bit 一致)
+                const int rc_cc = m.ls_active ? m.stage_cc[cur_stage] : m.sm_cc;
+                const bool rc_share = dec_rc && M == 1 && mode == 0 && rc_cc < 70 &&
+                                      (n_blocks + 1 <= 5) && (bank_stp->count <= 5);
+                if (rc_share) {
+                    k_ink_attn_res_rc_cat_rms<5><<<dim3(M, 7), 256, 0, st>>>(
+                        stp, q_res, is_swa, *bank_stp, m.d_msg_queries[ip - m.man.c.core_start],
+                        d_mixed, d_msgs, d_ctrl_cat, M, kInkHidden);
+                } else {
+                    k_ink_attn_res_3x_cat_rms<<<dim3(M, 4), 256, 0, st>>>(
+                        stp, q_res, is_swa, *bank_stp, m.d_msg_queries[ip - m.man.c.core_start],
+                        d_mixed, d_msgs, (M <= 16) ? d_ctrl_cat : nullptr, M, kInkHidden);
+                }
+                const bool share_src = rc_share && is_swa;
                 const float* src0 = d_mixed;
-                const float* src1 = d_mixed + 1 * n_hid;
-                const float* src2 = d_mixed + 2 * n_hid;
+                const float* src1 = share_src ? d_mixed : (d_mixed + 1 * n_hid);
+                const float* src2 = share_src ? d_mixed : (d_mixed + 2 * n_hid);
                 const float* wd0 = (const float*)m.trunk_ptr_stage(cur_stage, p + ".controllers.attn.down_weight");
                 const float* wg0 = (const float*)m.trunk_ptr_stage(cur_stage, p + ".controllers.attn.gain_weight");
                 const float* wf0 = (const float*)m.trunk_ptr_stage(cur_stage, p + ".controllers.attn.forget_weight");
